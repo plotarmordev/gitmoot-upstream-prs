@@ -198,7 +198,13 @@ func TestPipelineOrchestrateRootVoteGateFinalizesInsteadOfBlocking(t *testing.T)
 func TestPipelineOrchestrateRootDispatchBlockFinalizesInsteadOfBlocking(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
-	seedAgent(t, store, "coord", []string{"ask"}, "jerryfane/gitmoot")
+	// CRB-16: validateDelegationAuthorityCeiling gates on the parent's own
+	// registered AGENT capabilities, not job Type — this orchestrate-root
+	// coordinator keeps job Type "ask" (mirroring the council-lead-codex
+	// production pattern) and is registered with "implement" so its
+	// legitimate implement leg (exercising the unrelated dispatch-time
+	// block/finalize path below) keeps working.
+	seedAgent(t, store, "coord", []string{"ask", "implement"}, "jerryfane/gitmoot")
 	seedAgent(t, store, "impl", []string{"implement"}, "jerryfane/gitmoot")
 	engine := testEngine(store)
 

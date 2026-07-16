@@ -27,6 +27,11 @@ func seedVerifyCoordinator(t *testing.T, store *db.Store, payload JobPayload) {
 			{ID: "check", Agent: "verifier", Action: "review", Prompt: "verify it", FailurePolicy: "continue", SynthesisRule: "verify"},
 		},
 	}
+	// CRB-16: validateDelegationAuthorityCeiling gates on the parent's own
+	// registered AGENT capabilities, not job Type — "coord" keeps job Type
+	// "ask" (see the seedAgent(..., "coord", []string{"ask", "implement"}, ...)
+	// calls at each caller) so its legitimate implement "produce" leg keeps
+	// working while exercising the verify-synthesis machinery below.
 	insertCompletedJob(t, store, db.Job{ID: "parent-job", Agent: "coord", Type: "ask"}, payload)
 }
 
@@ -37,7 +42,7 @@ func seedVerifyCoordinator(t *testing.T, store *db.Store, payload JobPayload) {
 func TestEngineVerifySynthesisPassesEnqueuesNormalContinuation(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
-	seedAgent(t, store, "coord", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "coord", []string{"ask", "implement"}, "jerryfane/gitmoot")
 	seedAgent(t, store, "producer", []string{"implement"}, "jerryfane/gitmoot")
 	seedAgent(t, store, "verifier", []string{"review"}, "jerryfane/gitmoot")
 	engine := testEngine(store)
@@ -92,7 +97,7 @@ func TestEngineVerifySynthesisPassesEnqueuesNormalContinuation(t *testing.T) {
 func TestEngineVerifyVerdictFailedEnqueuesBoundedReplan(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
-	seedAgent(t, store, "coord", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "coord", []string{"ask", "implement"}, "jerryfane/gitmoot")
 	seedAgent(t, store, "producer", []string{"implement"}, "jerryfane/gitmoot")
 	seedAgent(t, store, "verifier", []string{"review"}, "jerryfane/gitmoot")
 	engine := testEngine(store)
@@ -148,7 +153,7 @@ func TestEngineVerifyVerdictFailedEnqueuesBoundedReplan(t *testing.T) {
 func TestEngineVerifyReplanAttemptCapRoutesToFinalize(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
-	seedAgent(t, store, "coord", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "coord", []string{"ask", "implement"}, "jerryfane/gitmoot")
 	seedAgent(t, store, "producer", []string{"implement"}, "jerryfane/gitmoot")
 	seedAgent(t, store, "verifier", []string{"review"}, "jerryfane/gitmoot")
 	engine := testEngine(store)
@@ -196,7 +201,7 @@ func TestEngineVerifyReplanAttemptCapRoutesToFinalize(t *testing.T) {
 func TestEngineVerifyContinuationSlotIdempotent(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
-	seedAgent(t, store, "coord", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "coord", []string{"ask", "implement"}, "jerryfane/gitmoot")
 	seedAgent(t, store, "producer", []string{"implement"}, "jerryfane/gitmoot")
 	seedAgent(t, store, "verifier", []string{"review"}, "jerryfane/gitmoot")
 	engine := testEngine(store)
@@ -251,7 +256,7 @@ func TestEngineVerifyContinuationSlotIdempotent(t *testing.T) {
 func TestEngineVerifyReplanAttemptCapConfigurable(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
-	seedAgent(t, store, "coord", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "coord", []string{"ask", "implement"}, "jerryfane/gitmoot")
 	seedAgent(t, store, "producer", []string{"implement"}, "jerryfane/gitmoot")
 	seedAgent(t, store, "verifier", []string{"review"}, "jerryfane/gitmoot")
 	engine := testEngine(store)
@@ -323,6 +328,9 @@ func TestEngineVerifyMissingChildFailsVerdict(t *testing.T) {
 // therefore never gets a child.
 func seedDepsBoundVerifyCoordinator(t *testing.T, store *db.Store, producerPolicy string) {
 	t.Helper()
+	// CRB-16: same rationale as seedVerifyCoordinator above — "coord" keeps
+	// job Type "ask"; its registered agent (seeded "implement" at each
+	// caller) is what authorizes the implement "produce" leg below.
 	insertCompletedJob(t, store, db.Job{ID: "parent-job", Agent: "coord", Type: "ask"}, JobPayload{
 		Repo:      "jerryfane/gitmoot",
 		Branch:    "task-005",
@@ -350,7 +358,7 @@ func seedDepsBoundVerifyCoordinator(t *testing.T, store *db.Store, producerPolic
 func TestEngineVerifyLegNeverRanUnderContinueDoesNotReplan(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
-	seedAgent(t, store, "coord", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "coord", []string{"ask", "implement"}, "jerryfane/gitmoot")
 	seedAgent(t, store, "producer", []string{"implement"}, "jerryfane/gitmoot")
 	seedAgent(t, store, "verifier", []string{"review"}, "jerryfane/gitmoot")
 	engine := testEngine(store)
@@ -402,7 +410,7 @@ func TestEngineVerifyLegNeverRanUnderContinueDoesNotReplan(t *testing.T) {
 func TestEngineVerifyLegNeverRanUnderEscalateDoesNotReplan(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
-	seedAgent(t, store, "coord", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "coord", []string{"ask", "implement"}, "jerryfane/gitmoot")
 	seedAgent(t, store, "producer", []string{"implement"}, "jerryfane/gitmoot")
 	seedAgent(t, store, "verifier", []string{"review"}, "jerryfane/gitmoot")
 	engine := testEngine(store)

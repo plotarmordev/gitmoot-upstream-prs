@@ -189,7 +189,12 @@ func TestEngineAdvanceJobSkipsArtifactsWithoutRoot(t *testing.T) {
 func TestDispatchDelegationsTwoImplementSiblingsGetSeparateWorktrees(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
-	seedAgent(t, store, "audit", []string{"ask"}, "jerryfane/gitmoot")
+	// CRB-16: validateDelegationAuthorityCeiling gates on the parent's own
+	// registered AGENT capabilities, not job Type — "audit" keeps job Type
+	// "ask" and is registered with "implement" so its implement fan-out
+	// (unrelated worktree/branch/retry mechanics under test here) keeps
+	// working, mirroring the council-lead-codex production pattern.
+	seedAgent(t, store, "audit", []string{"ask", "implement"}, "jerryfane/gitmoot")
 	seedAgent(t, store, "builder-a", []string{"implement"}, "jerryfane/gitmoot")
 	seedAgent(t, store, "builder-b", []string{"implement"}, "jerryfane/gitmoot")
 	home := t.TempDir()
@@ -263,7 +268,10 @@ func TestDispatchDelegationsSiblingsSharingWorktreeHintGetDistinctBranches(t *te
 	// not collide on a branch already checked out by the first.
 	ctx := context.Background()
 	store := openEngineStore(t)
-	seedAgent(t, store, "audit", []string{"ask"}, "jerryfane/gitmoot")
+	// CRB-16: validateDelegationAuthorityCeiling gates on the parent's own
+	// registered AGENT capabilities, not job Type — see the identical note in
+	// TestDispatchDelegationsTwoImplementSiblingsGetSeparateWorktrees above.
+	seedAgent(t, store, "audit", []string{"ask", "implement"}, "jerryfane/gitmoot")
 	seedAgent(t, store, "builder-a", []string{"implement"}, "jerryfane/gitmoot")
 	seedAgent(t, store, "builder-b", []string{"implement"}, "jerryfane/gitmoot")
 	home := t.TempDir()
@@ -318,7 +326,10 @@ func TestDispatchDelegationsWithoutWorktreeManagerEmitsSkippedEvent(t *testing.T
 	// isolation must be observable via a delegation_worktree_skipped event.
 	ctx := context.Background()
 	store := openEngineStore(t)
-	seedAgent(t, store, "audit", []string{"ask"}, "jerryfane/gitmoot")
+	// CRB-16: validateDelegationAuthorityCeiling gates on the parent's own
+	// registered AGENT capabilities, not job Type — see the identical note in
+	// TestDispatchDelegationsTwoImplementSiblingsGetSeparateWorktrees above.
+	seedAgent(t, store, "audit", []string{"ask", "implement"}, "jerryfane/gitmoot")
 	seedAgent(t, store, "builder", []string{"implement"}, "jerryfane/gitmoot")
 	engine := testEngine(store)
 	// No engine.Home / engine.DelegationWorktrees: isolation unavailable.
@@ -366,7 +377,10 @@ func TestEngineDelegationRetryGetsIsolatedWorktreePathAndBranch(t *testing.T) {
 	// failed original attempt's leftover worktree directory and checked-out branch.
 	ctx := context.Background()
 	store := openEngineStore(t)
-	seedAgent(t, store, "coord", []string{"ask"}, "jerryfane/gitmoot")
+	// CRB-16: validateDelegationAuthorityCeiling gates on the parent's own
+	// registered AGENT capabilities, not job Type — see the identical note in
+	// TestDispatchDelegationsTwoImplementSiblingsGetSeparateWorktrees above.
+	seedAgent(t, store, "coord", []string{"ask", "implement"}, "jerryfane/gitmoot")
 	seedAgent(t, store, "builder", []string{"implement"}, "jerryfane/gitmoot")
 	home := t.TempDir()
 	manager := &fakeWorktreeManager{}

@@ -42,7 +42,13 @@ const burst617Repo = "jerryfane/noted"
 func fanOutEphemeralImplementBurst(t *testing.T, engine Engine, store *db.Store, coordinatorID string, n int) []string {
 	t.Helper()
 	ctx := context.Background()
-	seedAgent(t, store, "coord-617", []string{"ask"}, burst617Repo)
+	// CRB-16: validateDelegationAuthorityCeiling gates on the parent's own
+	// registered AGENT capabilities, not job Type — this coordinator's job
+	// stays Type "ask" (mirroring the council-lead-codex production pattern:
+	// an ask-type job whose registered agent also carries "implement"), and
+	// its agent is registered with "implement" so its legitimate ephemeral
+	// implement fan-out keeps working.
+	seedAgent(t, store, "coord-617", []string{"ask", "implement"}, burst617Repo)
 
 	dels := make([]Delegation, 0, n)
 	for i := 0; i < n; i++ {

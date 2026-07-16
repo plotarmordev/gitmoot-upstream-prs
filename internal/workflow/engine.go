@@ -2467,7 +2467,7 @@ func (e Engine) dispatchDelegations(ctx context.Context, job db.Job, payload Job
 	// that does not acquire branch locks or other execution side effects.
 	for _, d := range delegations {
 		request := e.delegationRequest(job, payload, d)
-		if err := e.preflightDelegation(ctx, request); err != nil {
+		if err := e.preflightDelegation(ctx, job, request); err != nil {
 			// An unroutable delegation set (an unknown / not-allowed / uncapable
 			// agent — usually a runtime name where an agent NAME was required) is no
 			// longer a terminal block: that dead-ends the coordinator before any
@@ -4847,7 +4847,133 @@ func verifyVerdictPassed(delegations []Delegation, children map[string]db.Job, c
 	return true
 }
 
-func (e Engine) preflightDelegation(ctx context.Context, request JobRequest) error {
+// validateDelegationAuthorityCeiling is the CRB-16 fix: an in-code authority
+// ceiling on what a parent job's OWN registered agent entitles it to
+// delegate. Before this existed, Gitmoot's only delegation gate was
+// target-shaped (does the named agent exist / is it on this repo / does it
+// have the requested capability, or is the ephemeral spec well-formed) —
+// nothing checked the REQUESTER's own authority, so a read-only seat could
+// return a delegations[] entry naming an implement-capable agent, or an
+// ephemeral spec carrying a writable autonomy policy, and the daemon would
+// materialize it: a read-only reviewer using the very channel meant for
+// read-only fan-out to obtain unrestricted write access. Because review/ask
+// prompts routinely quote untrusted repository content, this is not merely a
+// confused-model bug but a realistic prompt-injection escape hatch — the
+// risk this ceiling closes.
+//
+// The discriminator is the PARENT'S OWN AGENT REGISTRATION (the agents table
+// row named by parent.Agent — its capabilities_json, loaded here via
+// Store.GetAgent), not the parent job's Type. A prior attempt at this fix
+// gated on job Type (ask/review vs. implement) and was rejected: production
+// coordinators legitimately run AS ask-type jobs while their registered
+// agent carries "implement" in its own capability set (e.g. a coordinator
+// agent registered ["ask","review","implement"] that reaches its implement
+// fan-out phase while the driving job is still typed "ask") — gating on job
+// Type broke that primary flow. Gating on the agent's registered
+// capabilities instead is authoritative in both directions: it keeps that
+// production coordinator's implement delegations working (its AGENT has
+// "implement", regardless of the current job's Type), and it still denies a
+// read-only reviewer seat registered WITHOUT "implement" (e.g.
+// ["ask","review"] or ["ask"]), regardless of what job Type that seat
+// happens to be running as.
+//
+// The rule is deliberately narrow and additive, matching the operator's
+// CRB-16 scope ruling (no DelegationGrant table, no persistence — an
+// in-code ceiling at the validation seam that reuses the existing agents
+// table):
+//
+//   - A parent whose own registered agent does NOT have "implement" in its
+//     capabilities may not delegate a child whose action is "implement"
+//     (named agent OR ephemeral spec — the action check is shape-independent).
+//   - Such a parent may also not delegate an EPHEMERAL child carrying an
+//     autonomy policy that grants write (workspace-write or
+//     danger-full-access, see runtime.PolicyGrantsImplementWrite), even when
+//     that child's declared action is itself ask/review. This closes the
+//     second escalation path CRB-16 documents: a nominally read-only
+//     ephemeral worker bootstrapped with a writable policy still has
+//     Bash/file-write access regardless of what "action" label it was
+//     given, because the daemon's write-policy guard elsewhere is
+//     implement-specific and never inspected here.
+//   - A parent whose registered agent already has "implement" is
+//     unaffected: it keeps its existing ability to delegate
+//     implement/writable-ephemeral children, exactly matching the
+//     council-lead-codex production pattern (ask-type job, implement-capable
+//     agent, implement child).
+//
+// A named (non-ephemeral) delegation's target agent capabilities were fixed
+// at operator registration time (UpsertAgent), not chosen by the untrusted
+// parent output, so the existing target-only capability check already
+// covers "is this agent allowed to implement at all" — this ceiling adds
+// the missing question, "may THIS parent's agent hand out that capability".
+//
+// Only "implement" and write-granting-ephemeral delegations reach the
+// Store.GetAgent lookup below: ask/review delegations (the overwhelming
+// majority of the suite, and of production ask/review fan-out) are
+// unaffected and incur no extra lookup, matching the product's existing
+// design where ask/review is the safe, non-escalating default and
+// "implement" is the one gated capability.
+func (e Engine) validateDelegationAuthorityCeiling(ctx context.Context, parent db.Job, request JobRequest) error {
+	requiresImplement := request.Action == "implement"
+	if !requiresImplement && request.Ephemeral != nil && runtime.PolicyGrantsImplementWrite(request.Ephemeral.AutonomyPolicy) {
+		requiresImplement = true
+	}
+	if !requiresImplement {
+		return nil
+	}
+	parentAgent, err := e.Store.GetAgent(ctx, parent.Agent)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// Fail closed: an unregistered/removed parent agent cannot be
+			// consulted for authority, so it is treated as holding none.
+			return fmt.Errorf(
+				"delegation authority ceiling (CRB-16): parent job %q has no registered agent %q; cannot authorize its %q delegation",
+				parent.ID, parent.Agent, request.Action,
+			)
+		}
+		return err
+	}
+	if contains(parentAgent.Capabilities, "implement") {
+		return nil
+	}
+	caps := strings.Join(parentAgent.Capabilities, ", ")
+	if request.Ephemeral != nil {
+		return fmt.Errorf(
+			"delegation authority ceiling (CRB-16): parent job %q (agent %q, capabilities [%s]) may not delegate an ephemeral %q child with autonomy policy %q; agent capabilities do not include \"implement\"",
+			parent.ID, parentAgent.Name, caps, request.Action, runtime.NormalizeStoredAutonomyPolicy(request.Ephemeral.AutonomyPolicy),
+		)
+	}
+	return fmt.Errorf(
+		"delegation authority ceiling (CRB-16): parent job %q (agent %q, capabilities [%s]) may not delegate a %q child; agent capabilities do not include \"implement\"",
+		parent.ID, parentAgent.Name, caps, request.Action,
+	)
+}
+
+func (e Engine) preflightDelegation(ctx context.Context, parent db.Job, request JobRequest) error {
+	// CRB-16 authority ceiling. Every check below this line asks "is the
+	// TARGET of this delegation a valid, capable, in-scope worker?" — that is
+	// the question preflightDelegation was built to answer, and it is not
+	// enough: none of it asks whether the REQUESTER may authorize a child with
+	// that much power in the first place. delegations[] is model-authored
+	// output — the parent job's own emitted JSON — and an ask/review parent's
+	// prompt routinely includes untrusted repository content (issue bodies,
+	// diffs, file contents). A prompt-injected or simply confused read-only
+	// seat can ask for a registered "implement" agent by name, or bootstrap a
+	// brand-new ephemeral worker with a writable autonomy policy, and prior to
+	// this check the target-only validation above would happily approve it:
+	// the named implementer IS a valid implement agent, the ephemeral spec IS
+	// well-formed. That is the confused-deputy escalation CRB-16 records: a
+	// read-only reviewer using its own legitimate delegation channel to obtain
+	// write access it was never granted. validateDelegationAuthorityCeiling is
+	// the single ceiling check for both delegation shapes: it runs before the
+	// ephemeral/named-agent branch below, so it is impossible to reach either
+	// downstream path with an unauthorized escalation still in flight, and it
+	// is the ONLY caller of preflightDelegation (dispatchDelegations' preflight
+	// loop) that could ever route a delegation to enqueue, so this is the
+	// single chokepoint both registered-agent and ephemeral children pass
+	// through on their way to becoming a durable child job row.
+	if err := e.validateDelegationAuthorityCeiling(ctx, parent, request); err != nil {
+		return err
+	}
 	// An ephemeral delegation routes to an on-demand worker that no agent row
 	// backs, so the registered-agent existence, repo-access, and capability checks
 	// do not apply: the ephemeral child inherits the coordinator's allowed repo
