@@ -73,6 +73,81 @@ type TaskWorktreeRequest struct {
 	BaseBranch string
 	Owner      string
 	Checkout   string
+	// RequiresBaseSHA is an optional dependency-ordering ancestry requirement
+	// (CRB-15: "a new root can use stale main after a dependency merge"). When
+	// set, AllocateTaskWorktree fetches DefaultBranchRef from the remote,
+	// resolves its exact SHA, and requires that SHA to be a descendant of (or
+	// identical to) RequiresBaseSHA -- fetch, resolve, and compare run as one
+	// atomic sequence against the REMOTE, never a cached local ref, so a stale
+	// local main can never satisfy it. Allocation fails closed, before any
+	// task/worktree/job row is written, when the requirement does not hold.
+	// Leave empty for an unconstrained allocation (the historical, unchanged
+	// behavior).
+	RequiresBaseSHA string
+	// DefaultBranchRef names the remote default branch RequiresBaseSHA is
+	// checked against (e.g. "main" or "release/next" -- any valid git ref
+	// name, including one containing '/', is accepted; see BranchName in the
+	// frozen council-protocol-v1 schema). Required whenever RequiresBaseSHA is
+	// set.
+	DefaultBranchRef string
+}
+
+// RemoteDefaultBranchResolver is implemented by a checkout-bound git client
+// that can fetch a remote and resolve an exact commit SHA for a ref. It backs
+// AllocateTaskWorktree's requires_base_sha CAS (CRB-15). The checkout-bound
+// gitutil.Client already satisfies it, so no extra plumbing is required beyond
+// the WorktreeManager callers already pass.
+type RemoteDefaultBranchResolver interface {
+	FetchRemote(ctx context.Context, remote string) error
+	RevParse(ctx context.Context, rev string) (string, error)
+}
+
+// BaseAncestryChecker reports whether ancestor is an ancestor of (or
+// identical to) descendant. It backs AllocateTaskWorktree's requires_base_sha
+// CAS (CRB-15). The checkout-bound gitutil.Client satisfies it.
+type BaseAncestryChecker interface {
+	IsAncestor(ctx context.Context, ancestor string, descendant string) (bool, error)
+}
+
+// resolveRequiredBase enforces requires_base_sha CAS (CRB-15) for
+// AllocateTaskWorktree. It fetches request.DefaultBranchRef from the remote,
+// resolves its exact commit SHA, and -- since request.RequiresBaseSHA is
+// already known non-empty by the caller -- requires that SHA to be a
+// descendant of (or identical to) it. The three steps (fetch, resolve,
+// compare) run as one sequence against the REMOTE, never a cached local ref:
+// this is the exact gap CRB-15 names ("Run 2 ... still used the pre-Run-1
+// main parent as base"). It returns the resolved SHA on success, or a
+// BlockedError (never a bare allocation) when the ancestry requirement is not
+// met, so the caller can refuse to create any task/worktree/job row.
+func resolveRequiredBase(ctx context.Context, manager WorktreeManager, request TaskWorktreeRequest) (string, error) {
+	ref := strings.TrimSpace(request.DefaultBranchRef)
+	if ref == "" {
+		return "", errors.New("task worktree default branch ref is required when requires_base_sha is set")
+	}
+	resolver, ok := manager.(RemoteDefaultBranchResolver)
+	if !ok {
+		return "", errors.New("worktree manager does not support remote base sha resolution required by requires_base_sha")
+	}
+	if err := resolver.FetchRemote(ctx, "origin"); err != nil {
+		return "", fmt.Errorf("fetch origin to resolve required base sha: %w", err)
+	}
+	resolved, err := resolver.RevParse(ctx, "origin/"+ref+"^{commit}")
+	if err != nil {
+		return "", fmt.Errorf("resolve remote default branch %q: %w", ref, err)
+	}
+	checker, ok := manager.(BaseAncestryChecker)
+	if !ok {
+		return "", errors.New("worktree manager does not support base ancestry checks required by requires_base_sha")
+	}
+	required := strings.TrimSpace(request.RequiresBaseSHA)
+	isAncestor, err := checker.IsAncestor(ctx, required, resolved)
+	if err != nil {
+		return "", fmt.Errorf("check whether required base %s is an ancestor of resolved default branch %s at %s: %w", required, ref, resolved, err)
+	}
+	if !isAncestor {
+		return "", BlockedError{Reason: fmt.Sprintf("resolved default branch %s at %s is not a descendant of required base %s; fetch/merge the dependency before allocating", ref, resolved, required)}
+	}
+	return resolved, nil
 }
 
 func (e Engine) AllocateTaskWorktree(ctx context.Context, request TaskWorktreeRequest, manager WorktreeManager) (db.Task, error) {
@@ -90,6 +165,17 @@ func (e Engine) AllocateTaskWorktree(ctx context.Context, request TaskWorktreeRe
 	}
 	if strings.TrimSpace(request.Owner) == "" {
 		return db.Task{}, errors.New("task worktree owner is required")
+	}
+	// CRB-15 CAS gate: resolved BEFORE any read/write below touches the store or
+	// the checkout, so a requirement that does not hold fails closed with
+	// nothing allocated -- no task row, no branch lock, no worktree, no job.
+	var allocatedBaseSHA string
+	if strings.TrimSpace(request.RequiresBaseSHA) != "" {
+		resolved, err := resolveRequiredBase(ctx, manager, request)
+		if err != nil {
+			return db.Task{}, err
+		}
+		allocatedBaseSHA = resolved
 	}
 	path, err := TaskWorktreePath(request.Home, request.Repo, request.TaskID)
 	if err != nil {
@@ -131,6 +217,9 @@ func (e Engine) AllocateTaskWorktree(ctx context.Context, request TaskWorktreeRe
 	}
 	if task.Branch == request.Branch && task.WorktreePath == path {
 		task.State = string(TaskImplementing)
+		if allocatedBaseSHA != "" {
+			task.AllocatedBaseSHA = allocatedBaseSHA
+		}
 		if err := e.Store.UpsertTask(ctx, task); err != nil {
 			if createdLock {
 				_, _ = e.Store.ReleaseLock(ctx, lock)
@@ -165,14 +254,18 @@ func (e Engine) AllocateTaskWorktree(ctx context.Context, request TaskWorktreeRe
 	if taskTitle == "" {
 		taskTitle = request.TaskTitle
 	}
+	if allocatedBaseSHA == "" {
+		allocatedBaseSHA = task.AllocatedBaseSHA
+	}
 	task = db.Task{
-		ID:           request.TaskID,
-		RepoFullName: request.Repo,
-		GoalID:       taskGoalID,
-		Title:        taskTitle,
-		State:        string(TaskImplementing),
-		Branch:       request.Branch,
-		WorktreePath: path,
+		ID:               request.TaskID,
+		RepoFullName:     request.Repo,
+		GoalID:           taskGoalID,
+		Title:            taskTitle,
+		State:            string(TaskImplementing),
+		Branch:           request.Branch,
+		WorktreePath:     path,
+		AllocatedBaseSHA: allocatedBaseSHA,
 	}
 	if err := e.Store.UpsertTask(ctx, task); err != nil {
 		if createdLock {

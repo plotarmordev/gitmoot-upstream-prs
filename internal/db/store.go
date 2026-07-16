@@ -216,6 +216,13 @@ type Task struct {
 	State        string
 	Branch       string
 	WorktreePath string
+	// AllocatedBaseSHA is the exact remote default-branch commit resolved and
+	// persisted by AllocateTaskWorktree's requires_base_sha CAS (CRB-15). It is
+	// set only when the allocation request carried a RequiresBaseSHA
+	// dependency-ordering requirement; an unconstrained allocation leaves it
+	// empty ('' default), preserving the historical behavior for the common
+	// case.
+	AllocatedBaseSHA string
 }
 
 // TaskEvent is one append-only task lifecycle transition. FromState and
@@ -2308,8 +2315,8 @@ func (s *Store) UpsertTask(ctx context.Context, task Task) error {
 // callers that must not resurrect a terminal task remain safe if its state
 // changes after their initial read.
 func (s *Store) UpsertTaskUnlessState(ctx context.Context, task Task, forbiddenState string) (bool, error) {
-	result, err := s.db.ExecContext(ctx, `INSERT INTO tasks(id, repo_full_name, goal_id, title, state, branch, worktree_path, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+	result, err := s.db.ExecContext(ctx, `INSERT INTO tasks(id, repo_full_name, goal_id, title, state, branch, worktree_path, allocated_base_sha, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 		ON CONFLICT(id) DO UPDATE SET
 			repo_full_name = excluded.repo_full_name,
 			goal_id = excluded.goal_id,
@@ -2320,9 +2327,13 @@ func (s *Store) UpsertTaskUnlessState(ctx context.Context, task Task, forbiddenS
 				WHEN excluded.worktree_path <> '' THEN excluded.worktree_path
 				ELSE tasks.worktree_path
 			END,
+			allocated_base_sha = CASE
+				WHEN excluded.allocated_base_sha <> '' THEN excluded.allocated_base_sha
+				ELSE tasks.allocated_base_sha
+			END,
 			updated_at = CURRENT_TIMESTAMP
 		WHERE tasks.state <> ?`,
-		task.ID, task.RepoFullName, task.GoalID, task.Title, task.State, task.Branch, task.WorktreePath,
+		task.ID, task.RepoFullName, task.GoalID, task.Title, task.State, task.Branch, task.WorktreePath, task.AllocatedBaseSHA,
 		strings.TrimSpace(forbiddenState))
 	if err != nil {
 		return false, err
@@ -2337,8 +2348,8 @@ func (s *Store) ClearTaskWorktreePath(ctx context.Context, id string) error {
 }
 
 func upsertTask(ctx context.Context, execer sqlExecer, task Task) error {
-	_, err := execer.ExecContext(ctx, `INSERT INTO tasks(id, repo_full_name, goal_id, title, state, branch, worktree_path, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+	_, err := execer.ExecContext(ctx, `INSERT INTO tasks(id, repo_full_name, goal_id, title, state, branch, worktree_path, allocated_base_sha, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 		ON CONFLICT(id) DO UPDATE SET
 			repo_full_name = excluded.repo_full_name,
 			goal_id = excluded.goal_id,
@@ -2349,8 +2360,12 @@ func upsertTask(ctx context.Context, execer sqlExecer, task Task) error {
 				WHEN excluded.worktree_path <> '' THEN excluded.worktree_path
 				ELSE tasks.worktree_path
 			END,
+			allocated_base_sha = CASE
+				WHEN excluded.allocated_base_sha <> '' THEN excluded.allocated_base_sha
+				ELSE tasks.allocated_base_sha
+			END,
 			updated_at = CURRENT_TIMESTAMP`,
-		task.ID, task.RepoFullName, task.GoalID, task.Title, task.State, task.Branch, task.WorktreePath)
+		task.ID, task.RepoFullName, task.GoalID, task.Title, task.State, task.Branch, task.WorktreePath, task.AllocatedBaseSHA)
 	return err
 }
 
@@ -2373,8 +2388,8 @@ func (s *Store) UpsertGoalWithTasks(ctx context.Context, goal Goal, tasks []Task
 }
 
 func upsertImportedTask(ctx context.Context, execer sqlExecer, task Task) error {
-	_, err := execer.ExecContext(ctx, `INSERT INTO tasks(id, repo_full_name, goal_id, title, state, branch, worktree_path, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+	_, err := execer.ExecContext(ctx, `INSERT INTO tasks(id, repo_full_name, goal_id, title, state, branch, worktree_path, allocated_base_sha, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 			ON CONFLICT(id) DO UPDATE SET
 				repo_full_name = CASE
 					WHEN excluded.repo_full_name <> '' THEN excluded.repo_full_name
@@ -2385,8 +2400,9 @@ func upsertImportedTask(ctx context.Context, execer sqlExecer, task Task) error 
 				state = tasks.state,
 			branch = tasks.branch,
 			worktree_path = tasks.worktree_path,
+			allocated_base_sha = tasks.allocated_base_sha,
 			updated_at = CURRENT_TIMESTAMP`,
-		task.ID, task.RepoFullName, task.GoalID, task.Title, task.State, task.Branch, task.WorktreePath)
+		task.ID, task.RepoFullName, task.GoalID, task.Title, task.State, task.Branch, task.WorktreePath, task.AllocatedBaseSHA)
 	return err
 }
 
@@ -2627,14 +2643,14 @@ func activeJobMatchingTaskTx(ctx context.Context, tx *sql.Tx, taskID string, rep
 
 func scanTask(row interface{ Scan(dest ...any) error }) (Task, error) {
 	var task Task
-	if err := row.Scan(&task.ID, &task.RepoFullName, &task.GoalID, &task.Title, &task.State, &task.Branch, &task.WorktreePath); err != nil {
+	if err := row.Scan(&task.ID, &task.RepoFullName, &task.GoalID, &task.Title, &task.State, &task.Branch, &task.WorktreePath, &task.AllocatedBaseSHA); err != nil {
 		return Task{}, err
 	}
 	return task, nil
 }
 
 func taskSelectSQL() string {
-	return `SELECT id, repo_full_name, goal_id, title, state, branch, worktree_path`
+	return `SELECT id, repo_full_name, goal_id, title, state, branch, worktree_path, allocated_base_sha`
 }
 
 func (s *Store) UpsertPullRequest(ctx context.Context, pr PullRequest) error {
@@ -9241,5 +9257,16 @@ ALTER TABLE schema_migrations ADD COLUMN predecessor_digest TEXT NOT NULL DEFAUL
 	`
 ALTER TABLE jobs ADD COLUMN protocol_task_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE jobs ADD COLUMN protocol_attempt_id TEXT NOT NULL DEFAULT '';
+	`,
+	// Council correction packet W2-05 (CRB-15): "a new root can use stale main
+	// after a dependency merge". AllocateTaskWorktree's requires_base_sha CAS
+	// resolves the remote default branch's exact SHA at allocation time (never
+	// trusting a cached local ref) and persists it here, so a later reconciler
+	// or operator can see exactly which commit a task's worktree was actually
+	// rooted at. Empty ('') for every task allocated without a
+	// requires_base_sha dependency-ordering requirement -- the unconstrained,
+	// historical allocation path is unaffected.
+	`
+ALTER TABLE tasks ADD COLUMN allocated_base_sha TEXT NOT NULL DEFAULT '';
 	`,
 }

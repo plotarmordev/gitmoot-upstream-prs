@@ -131,6 +131,28 @@ func (c Client) BranchExists(ctx context.Context, branch string) (bool, error) {
 	return true, nil
 }
 
+// IsAncestor reports whether ancestor is an ancestor of (or identical to)
+// descendant, via `git merge-base --is-ancestor` (exit 0 = true, exit 1 = not
+// an ancestor, any other failure -- e.g. an unresolvable object because the
+// caller forgot to fetch it first -- also reads as false here, mirroring
+// BranchExists' fail-closed-to-false pattern rather than surfacing a distinct
+// error path). It backs a task's requires_base_sha CAS (CRB-15): the resolved
+// remote default-branch SHA must descend from a completed dependency's SHA
+// before allocation may proceed.
+func (c Client) IsAncestor(ctx context.Context, ancestor string, descendant string) (bool, error) {
+	if err := validateRef(ancestor); err != nil {
+		return false, err
+	}
+	if err := validateRef(descendant); err != nil {
+		return false, err
+	}
+	_, err := c.run(ctx, "merge-base", "--is-ancestor", ancestor, descendant)
+	if err != nil {
+		return false, nil
+	}
+	return true, nil
+}
+
 // RemoteBranches returns the requested branches that exist on origin using one
 // exact-ref ls-remote call. Callers batch a bounded candidate set so stale-task
 // reconciliation never performs one subprocess/network round trip per task.

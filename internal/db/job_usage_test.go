@@ -197,6 +197,17 @@ CREATE TABLE resource_locks (
 	updated_at TEXT NOT NULL,
 	expires_at TEXT NOT NULL
 );
+-- A minimal tasks table (as it existed at the input_tokens migration point) so
+-- the later W2-05 allocated_base_sha ALTER ADD COLUMN that runs in this pass
+-- has its table; the real table was created by an earlier (here pre-seeded-as-
+-- applied) migration.
+CREATE TABLE tasks (
+	id TEXT PRIMARY KEY,
+	goal_id TEXT NOT NULL,
+	title TEXT NOT NULL,
+	state TEXT NOT NULL,
+	branch TEXT NOT NULL DEFAULT ''
+);
 CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
 INSERT INTO jobs(id, agent, type, state, payload) VALUES ('old', 'w', 'ask', 'succeeded', '{}');
 `); err != nil {
