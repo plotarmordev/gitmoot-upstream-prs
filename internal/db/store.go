@@ -18,6 +18,7 @@ import (
 	"time"
 
 	gitutil "github.com/jerryfane/gitmoot/internal/git"
+	"github.com/jerryfane/gitmoot/internal/protocol"
 
 	_ "modernc.org/sqlite"
 )
@@ -313,6 +314,25 @@ type Job struct {
 	// "2006-01-02 15:04:05"). Populated by ListJobs/GetJob so the web dashboard
 	// can stamp a node's StartedAt; other readers may leave it zero.
 	CreatedAt string
+	// ProtocolTaskID and ProtocolAttemptID correlate this job row to the
+	// frozen CouncilProtocolV1 identity spine (DESIGN.md decision log #2/#3).
+	// Protocol identifiers are newly-minted, flat, opaque tokens -- distinct
+	// in shape from jobs.id, which is slash-delimited (e.g.
+	// "parent/delegation/<id>/retry/<n>") and reused as a worktree path
+	// segment -- so they cannot be recovered by parsing or truncating this
+	// job's own ID; they need their own columns. ProtocolAttemptID identifies
+	// THIS dispatched unit (this row) uniquely. ProtocolTaskID identifies the
+	// logical unit of work and stays STABLE across retries: a retry mints an
+	// entirely new job row (and therefore a new ProtocolAttemptID) but
+	// carries its predecessor's ProtocolTaskID forward by setting it on the
+	// Job passed to CreateJob/CreateJobWithEvent before the call. Both
+	// columns are minted with protocol.NewOpaqueID() by CreateJob/
+	// CreateJobWithEvent whenever the caller leaves them empty, so ordinary
+	// callers (which never set these fields) get fresh, correlatable
+	// identity for free. Rows created before this packet's migration read
+	// back as "" (unminted, pre-protocol jobs) and are left untouched.
+	ProtocolTaskID    string
+	ProtocolAttemptID string
 }
 
 type JobEvent struct {
@@ -2746,23 +2766,61 @@ func jobResultHashFromPayload(payload string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// mintProtocolIdentity fills in job.ProtocolTaskID/job.ProtocolAttemptID with
+// freshly-minted protocol.NewOpaqueID() values wherever the caller left them
+// empty (council correction packet W1-02a; DESIGN.md decision log #2/#3).
+// ProtocolAttemptID is always empty for a brand-new dispatch, so it is always
+// freshly minted. ProtocolTaskID is left empty by every ordinary caller too
+// (also freshly minted, giving the job its own task identity), EXCEPT a
+// retry, which mints a new job row for the same logical unit of work and
+// therefore pre-populates job.ProtocolTaskID with its predecessor's value
+// before calling CreateJob/CreateJobWithEvent -- mintProtocolIdentity leaves
+// an already-set value untouched so that continuity survives. It mutates
+// job in place and is called by every INSERT site that mints identity
+// (CreateJob, CreateJobWithEvent); the one exception is
+// CreateExternallyDrivenJobWithEvent, which is out of this packet's scope
+// (see W1-02a packet notes).
+func mintProtocolIdentity(job *Job) error {
+	if job.ProtocolTaskID == "" {
+		id, err := protocol.NewOpaqueID()
+		if err != nil {
+			return fmt.Errorf("mint protocol_task_id: %w", err)
+		}
+		job.ProtocolTaskID = id
+	}
+	if job.ProtocolAttemptID == "" {
+		id, err := protocol.NewOpaqueID()
+		if err != nil {
+			return fmt.Errorf("mint protocol_attempt_id: %w", err)
+		}
+		job.ProtocolAttemptID = id
+	}
+	return nil
+}
+
 func (s *Store) CreateJob(ctx context.Context, job Job) error {
+	if err := mintProtocolIdentity(&job); err != nil {
+		return err
+	}
 	// root_id is a denormalized index of the engine's rootJobID() rule (#420):
 	// bind the SAME COALESCE(NULLIF(?,''), ?) to (payload.RootJobID, job.ID) so
 	// the invariant — payload root when set, else self-root — holds regardless of
 	// caller. payload.RootJobID stays the value source of truth.
 	projection := jobProjectionFromPayload(job.Payload)
-	_, err := s.db.ExecContext(ctx, `INSERT INTO jobs(id, agent, type, state, payload, result_hash, parent_job_id, delegation_id, delegation_depth, delegated_by, root_id, workflow_id, repo, pull_request, blocker_retry_at, blocker_suggested_action, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?,''), ?), ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+	_, err := s.db.ExecContext(ctx, `INSERT INTO jobs(id, agent, type, state, payload, result_hash, parent_job_id, delegation_id, delegation_depth, delegated_by, root_id, workflow_id, repo, pull_request, blocker_retry_at, blocker_suggested_action, protocol_task_id, protocol_attempt_id, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?,''), ?), ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
 		job.ID, job.Agent, job.Type, job.State, job.Payload,
 		jobResultHashFromPayload(job.Payload),
 		job.ParentJobID, job.DelegationID, job.DelegationDepth, job.DelegatedBy,
 		rootIDFromPayload(job.Payload), job.ID, projection.WorkflowID, projection.Repo, projection.PullRequest,
-		projection.BlockerRetryAt, projection.BlockerSuggestedAction)
+		projection.BlockerRetryAt, projection.BlockerSuggestedAction, job.ProtocolTaskID, job.ProtocolAttemptID)
 	return err
 }
 
 func (s *Store) CreateJobWithEvent(ctx context.Context, job Job, event JobEvent) error {
+	if err := mintProtocolIdentity(&job); err != nil {
+		return err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -2772,13 +2830,13 @@ func (s *Store) CreateJobWithEvent(ctx context.Context, job Job, event JobEvent)
 	// See CreateJob: same COALESCE(NULLIF(?,''), ?) bound to (payload.RootJobID,
 	// job.ID) denormalizes the rootJobID() rule onto the indexed root_id column.
 	projection := jobProjectionFromPayload(job.Payload)
-	if _, err := tx.ExecContext(ctx, `INSERT INTO jobs(id, agent, type, state, payload, result_hash, parent_job_id, delegation_id, delegation_depth, delegated_by, root_id, workflow_id, repo, pull_request, blocker_retry_at, blocker_suggested_action, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?,''), ?), ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+	if _, err := tx.ExecContext(ctx, `INSERT INTO jobs(id, agent, type, state, payload, result_hash, parent_job_id, delegation_id, delegation_depth, delegated_by, root_id, workflow_id, repo, pull_request, blocker_retry_at, blocker_suggested_action, protocol_task_id, protocol_attempt_id, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?,''), ?), ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
 		job.ID, job.Agent, job.Type, job.State, job.Payload,
 		jobResultHashFromPayload(job.Payload),
 		job.ParentJobID, job.DelegationID, job.DelegationDepth, job.DelegatedBy,
 		rootIDFromPayload(job.Payload), job.ID, projection.WorkflowID, projection.Repo, projection.PullRequest,
-		projection.BlockerRetryAt, projection.BlockerSuggestedAction); err != nil {
+		projection.BlockerRetryAt, projection.BlockerSuggestedAction, job.ProtocolTaskID, job.ProtocolAttemptID); err != nil {
 		return err
 	}
 	if event.JobID == "" {
@@ -9163,5 +9221,25 @@ WHERE kind = 'advance_retry'
 ALTER TABLE schema_migrations ADD COLUMN migration_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE schema_migrations ADD COLUMN content_digest TEXT NOT NULL DEFAULT '';
 ALTER TABLE schema_migrations ADD COLUMN predecessor_digest TEXT NOT NULL DEFAULT '';
+	`,
+	// Council correction packet W1-02a: jobs.protocol_task_id/protocol_attempt_id.
+	// CouncilProtocolV1 identifiers (task_id, attempt_id, ...) are newly-minted,
+	// flat, opaque tokens deliberately distinct in shape from gitmoot's internal
+	// jobs.id, which is slash-delimited (e.g. "parent/delegation/<id>/retry/<n>")
+	// and reused directly as a filesystem worktree path segment -- they cannot be
+	// recovered by parsing or truncating jobs.id, so correlating a protocol
+	// attempt back to the job row it was minted for needs its own columns
+	// (DESIGN.md decision log #2/#3). This is the first migration minted through
+	// W1-01's ID+digest path rather than the old bare-ordinal slice (Review
+	// finding #7): reconcileMigrationIdentity computes and stamps this row's
+	// migration_id/content_digest/predecessor_digest the same way it does for
+	// every historical row, no special-casing needed. CreateJob/
+	// CreateJobWithEvent mint both columns via protocol.NewOpaqueID() for every
+	// job created from here on; existing rows read back as '' (unminted,
+	// pre-protocol jobs) and are left untouched -- there is no historical data to
+	// backfill since no protocol identity existed before this packet.
+	`
+ALTER TABLE jobs ADD COLUMN protocol_task_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE jobs ADD COLUMN protocol_attempt_id TEXT NOT NULL DEFAULT '';
 	`,
 }
