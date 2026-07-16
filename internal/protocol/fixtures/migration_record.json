@@ -1,0 +1,15 @@
+{
+  "protocol_version": "1.0.0",
+  "record_id": "rec-mig-0001",
+  "record_type": "migration_record",
+  "issued_by": "gitmoot-core",
+  "issued_at": "2026-07-16T03:34:55Z",
+  "migration_id": "mig-0001",
+  "sequence": 0,
+  "content_digest": {
+    "algo": "sha256",
+    "hex": "1c1567f4aaf4ca94765973fcdbdbb21d8edb7c4aafc7d2fd8321a7cc43288b3a"
+  },
+  "predecessor_digest": null,
+  "applied_at": "2026-07-16T03:34:55Z"
+}

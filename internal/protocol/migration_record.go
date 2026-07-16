@@ -5,11 +5,10 @@
 // package and none is planned (Council correction packet Review #5 / operator
 // ruling R1).
 //
-// MigrationRecord below is this package's first consumer, added by W1-01. It
-// is PROVISIONAL: W1-02b adds the golden-fixture conformance harness that
-// validates hand-written structs against the frozen schema, so until W1-02b
-// lands this struct is correct by inspection against the schema's
-// $defs.MigrationRecord, not yet machine-checked.
+// MigrationRecord below is this package's first consumer, added by W1-01 and
+// registered with the golden-fixture conformance harness (W1-02b,
+// conformance_test.go) against the schema's $defs.MigrationRecord, so it is
+// now machine-checked rather than merely correct by inspection.
 package protocol
 
 // ProtocolVersion is the frozen CouncilProtocolV1 version string (schema
@@ -56,4 +55,13 @@ type MigrationRecord struct {
 	ContentDigest     ContentDigest  `json:"content_digest"`
 	PredecessorDigest *ContentDigest `json:"predecessor_digest"`
 	AppliedAt         string         `json:"applied_at"` // RFC3339 UTC
+}
+
+func init() {
+	RegisterFixture(FixtureBinding{
+		RecordType:  "migration_record",
+		SchemaDef:   "MigrationRecord",
+		FixtureFile: "migration_record.json",
+		New:         func() any { return &MigrationRecord{} },
+	})
 }

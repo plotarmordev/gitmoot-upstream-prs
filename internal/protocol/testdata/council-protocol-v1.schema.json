@@ -1,0 +1,2855 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gitmoot.dev/schemas/council-protocol-v1.json",
+  "title": "CouncilProtocolV1",
+  "description": "Frozen, typed, cross-repo execution contract between gitmoot (core; sole issuer of every record kind except council_result) and council (bash/python seats; producer of council_result only, consumer of everything else). One JSON document = one immutable record. Nothing here is ever updated in place: the 'current state' of any entity (a lease, an advancement decision, a CI observation) is always a fold over the most-recent record sharing that entity's correlation key, computed by the reading consumer, never a mutated row. record_type is the sole discriminator; every record kind repeats the same five envelope properties (protocol_version, record_id, record_type, issued_by, issued_at) directly in its own flat properties/required list rather than via allOf/unevaluatedProperties inheritance, to avoid the additionalProperties-with-allOf failure class one of the three source drafts caught in its own self-review. No field whose value is prose (summary, message, notes) may be parsed by any consumer to drive control flow (audit coding rule 5) -- every decision-bearing fact has a typed, enum- or digest-constrained sibling field. Identifiers in this protocol (record_id, task_id, attempt_id, root_id, ...) are NEWLY MINTED opaque tokens issued by gitmoot-core at record-persist time; they are deliberately NOT gitmoot's internal hierarchical jobs.id (which is slash-delimited, e.g. 'parent/delegation/<id>/retry/<n>', and used directly as a filesystem worktree path segment -- see FIXTURES-PLAN.md). Correlating a protocol identifier back to the internal jobs.id/tasks.id it was minted for is a new database column gitmoot must add (P0-1), not a re-typing of the existing column. See DESIGN.md for full rationale, CRB/R foreclosure citations, the audit-\u00a79 coverage matrix, and the decision log recording which of the three source drafts (or which synthesis) won each contested point and why.",
+  "type": "object",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/ExecutionContract"
+    },
+    {
+      "$ref": "#/$defs/DelegationGrant"
+    },
+    {
+      "$ref": "#/$defs/WriterLease"
+    },
+    {
+      "$ref": "#/$defs/CouncilResult"
+    },
+    {
+      "$ref": "#/$defs/ExecutionRecord"
+    },
+    {
+      "$ref": "#/$defs/ResultCheckRecord"
+    },
+    {
+      "$ref": "#/$defs/VerdictRecord"
+    },
+    {
+      "$ref": "#/$defs/GateIntentRecord"
+    },
+    {
+      "$ref": "#/$defs/CiObservationRecord"
+    },
+    {
+      "$ref": "#/$defs/AdvancementRecord"
+    },
+    {
+      "$ref": "#/$defs/RepairRequestRecord"
+    },
+    {
+      "$ref": "#/$defs/ProviderEffectIntent"
+    },
+    {
+      "$ref": "#/$defs/ProviderEffectResult"
+    },
+    {
+      "$ref": "#/$defs/MigrationRecord"
+    },
+    {
+      "$ref": "#/$defs/ArtifactRef"
+    }
+  ],
+  "$defs": {
+    "ProtocolVersion": {
+      "type": "string",
+      "const": "1.0.0",
+      "description": "Frozen protocol version. Any field change that is not purely additive (new optional property, new enum member with a documented default handling) ships as 2.0.0 with a dual-parse deprecation window; see DESIGN.md decision log #1."
+    },
+    "Id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+      "description": "Opaque, gitmoot-core-minted identifier (ULID recommended). Equality-only; never parsed for structure or meaning by any consumer. Deliberately excludes '/' and ':' -- unlike gitmoot's internal jobs.id, which is slash-delimited and reused as a worktree path segment. Protocol identifiers (record_id, task_id, attempt_id, root_id, delegation_id, lease_id, ...) are NEW values minted at record-persist time and correlated back to gitmoot's internal row via a new DB column, never derived by parsing or truncating jobs.id (see FIXTURES-PLAN.md and DESIGN.md decision log #2)."
+    },
+    "Timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC3339 UTC, always core-stamped (server clock). Never accepted verbatim from a caller or model (coding rule 5)."
+    },
+    "GitSha": {
+      "type": "string",
+      "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$",
+      "description": "Full git object id, lowercase hex: exactly 40 characters (SHA-1) or exactly 64 (SHA-256 git repositories). Abbreviated SHAs are never protocol-legal -- an abbreviated prefix is not a unique object id, which reopens exactly the ambiguity CRB-15/CRB-09 exist to close. GitHub API responses (the real data source) are always full-length, so there is no operational reason to admit a shorter pattern."
+    },
+    "BranchName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255,
+      "pattern": "^(?!/)(?!.*//)(?!.*\\.\\.)[^\\x00-\\x1f ~^:?*\\[\\\\]+(?<!/)(?<!\\.lock)$",
+      "description": "Valid git ref name. Deliberately permits '/' (CRB-15: a narrow branch-name regex must not reject legitimate defaults such as release/next) while excluding whitespace, control characters, '..', a leading/trailing/doubled '/', and a trailing '.lock'."
+    },
+    "ContentDigest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "algo",
+        "hex"
+      ],
+      "properties": {
+        "algo": {
+          "type": "string",
+          "const": "sha256"
+        },
+        "hex": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "Lowercase sha256 hex digest of the exact byte content addressed (file, config, canonicalized JSON, diff, ...), computed by the core or a trusted backend from bytes it read itself -- never accepted as a caller-supplied unkeyed hash (coding rule 6)."
+        }
+      },
+      "description": "Locked to sha256 only for v1 (no multi-algorithm branch) -- decisive, matches existing codebase precedent (content_sha256 fields), and avoids inventing an algorithm-negotiation surface no implementation needs yet (coding rule 2)."
+    },
+    "NamedDigest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "kind",
+        "digest"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "executable",
+            "shared_library",
+            "interpreter",
+            "python_package",
+            "go_module",
+            "shell_tool",
+            "generated_config",
+            "kit_script"
+          ]
+        },
+        "digest": {
+          "$ref": "#/$defs/ContentDigest"
+        },
+        "resolved_path": {
+          "type": "string",
+          "description": "Informational only -- the pathname observed when the digest was computed. NEVER re-read by pathname later; identity is `digest`, not this string (forecloses CRB-01, CRB-10, R-20's mutable-path-as-identity pattern)."
+        }
+      }
+    },
+    "CredentialRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "store",
+        "key_id"
+      ],
+      "properties": {
+        "store": {
+          "type": "string",
+          "enum": [
+            "os_keychain",
+            "env_broker",
+            "file_vault",
+            "gh_app_installation"
+          ]
+        },
+        "key_id": {
+          "$ref": "#/$defs/Id"
+        }
+      },
+      "description": "Opaque reference into a credential store, resolved server-side by gitmoot-core at spawn time. Never the raw secret, never an env var name, never a filesystem path or symlink target (forecloses R-12/R-13's credential-symlink and ambient-passthrough defects). This is net-new infrastructure -- see FIXTURES-PLAN.md / DESIGN.md decision log #9 for the interim compatibility shape needed alongside today's ambient env-var credential passthrough."
+    },
+    "Provider": {
+      "type": "string",
+      "enum": [
+        "github",
+        "local"
+      ]
+    },
+    "RuntimeFamily": {
+      "type": "string",
+      "enum": [
+        "codex",
+        "claude",
+        "kimi",
+        "kimi-cli",
+        "shell"
+      ],
+      "description": "Exactly gitmoot's registered runtime adapter set (internal/runtime/adapter.go: CodexRuntime, ClaudeRuntime, KimiRuntime, KimiCLIRuntime, ShellRuntime -- confirmed exhaustive by registry_test.go). No invented members (no 'glm', no 'gemini' -- those are Council-side bridge profiles that run THROUGH the 'claude' or 'codex' adapter against a non-default API endpoint, see BridgeProfile, not distinct gitmoot runtimes; coding rule 2/R-14: do not model an interface production does not implement)."
+    },
+    "EphemeralRuntimeFamily": {
+      "type": "string",
+      "enum": [
+        "codex",
+        "claude",
+        "kimi"
+      ],
+      "description": "Subset of RuntimeFamily legal for an ephemeral (unregistered, on-demand) worker -- matches gitmoot's EphemeralRuntimes exactly (internal/workflow/result.go). 'kimi-cli' and 'shell' are never legal ephemeral targets."
+    },
+    "ExecutionMode": {
+      "type": "string",
+      "enum": [
+        "tool_capable",
+        "text_only"
+      ],
+      "description": "R-12's required 'explicit backend capability contract, no hidden tools in text-only mode.' Whether this attempt's backend may invoke tools/shell/filesystem access beyond producing text. A bridge/text-only reviewer (e.g. council-zai-glm) MUST be execution_mode=text_only; the runtime adapter is required to enforce this at spawn (sandboxed/no-tool invocation), not merely declare it here."
+    },
+    "EffortLevel": {
+      "type": "string",
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "max"
+      ]
+    },
+    "ThinkingLevel": {
+      "type": "string",
+      "enum": [
+        "none",
+        "low",
+        "medium",
+        "high",
+        "max"
+      ]
+    },
+    "AutonomyPolicy": {
+      "type": "string",
+      "enum": [
+        "read_only",
+        "workspace_write",
+        "danger_full_access"
+      ],
+      "description": "Ordinal write-authority: read_only(0) < workspace_write(1) < danger_full_access(2). 'auto' is deliberately NOT protocol-legal (R-10: 'auto' resolving differently per host/runtime is exactly the ambient-authority pattern coding rule 5 forbids -- confirmed live in internal/cli/agent_permissions.go's readOnlyImplementationBlocked comment: 'auto emits no --permission-mode ... non-deterministic across hosts'). CLI ergonomics may still accept 'auto' from an operator; gitmoot-core must resolve it to one concrete member of this enum before any record here is issued."
+    },
+    "DelegationAction": {
+      "type": "string",
+      "enum": [
+        "ask",
+        "review",
+        "implement"
+      ],
+      "description": "Matches ResultDecisions-adjacent DelegationFailurePolicies/action set exactly as validated by internal/workflow/result.go's validateAgentResult (action must be one of ask, review, implement)."
+    },
+    "DecisionValue": {
+      "type": "string",
+      "enum": [
+        "approved",
+        "changes_requested",
+        "blocked",
+        "implemented",
+        "failed",
+        "skipped"
+      ],
+      "description": "Byte-identical to gitmoot's existing ResultDecisions (internal/workflow/result.go) -- unchanged so the decision vocabulary itself is not a migration break."
+    },
+    "IdentitySpine": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "root_id",
+        "task_id",
+        "parent_attempt_id",
+        "attempt_id",
+        "attempt_ordinal",
+        "delegation_id",
+        "delegation_depth"
+      ],
+      "properties": {
+        "root_id": {
+          "$ref": "#/$defs/Id",
+          "description": "The top-level council run this attempt descends from. Equals task_id for a root attempt."
+        },
+        "task_id": {
+          "$ref": "#/$defs/Id",
+          "description": "Stable across repair/retry rounds of one logical unit of work. Newly minted per dispatched unit (every ask/review/implement leg gets one, not only implement legs -- needed so review allocation (CRB-09/CRB-14) and repair binding (CRB-08) have their own lineage key independent of the writer's). NOT gitmoot's internal branch-scoped Task.ID: when an implement attempt's task_id has a corresponding gitmoot Task row, they may share a value by construction, but a task_id is required even for ask/review dispatches that never create a Task row."
+        },
+        "parent_attempt_id": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The delegating attempt's attempt_id, or null for a root attempt."
+        },
+        "attempt_id": {
+          "$ref": "#/$defs/Id",
+          "description": "Unique per (re)execution. A retried/repaired task mints a new attempt_id while task_id stays stable. This is the fencing/correlation unit every other record binds to -- not job_id reuse."
+        },
+        "attempt_ordinal": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "1-based sequence of this attempt within task_id (1st implement = 1, repair-1 = 2, repair-2 = 3, ...)."
+        },
+        "delegation_id": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The parent's council_result.delegations[].id that produced this attempt, or null for a root attempt."
+        },
+        "delegation_depth": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "0 for a root attempt; parent depth + 1 otherwise. Checked against the parent's DelegationGrant.max_depth."
+        }
+      }
+    },
+    "PullRequestRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "number",
+        "url"
+      ],
+      "properties": {
+        "state": {
+          "type": "string",
+          "enum": [
+            "none",
+            "open",
+            "closed",
+            "merged"
+          ]
+        },
+        "number": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "url": {
+          "oneOf": [
+            {
+              "type": "string",
+              "format": "uri"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "if": {
+        "properties": {
+          "state": {
+            "const": "none"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "number": {
+            "const": null
+          },
+          "url": {
+            "const": null
+          }
+        }
+      },
+      "else": {
+        "required": [
+          "number",
+          "url"
+        ],
+        "properties": {
+          "number": {
+            "type": "integer"
+          },
+          "url": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "number/url are both null iff state=none, both present otherwise -- schema-enforced (not merely documented, resolving an open question two of the three source drafts left to the binding generator)."
+    },
+    "RepositoryIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "provider_repo_id",
+        "canonical_repo_key",
+        "full_name",
+        "default_branch"
+      ],
+      "properties": {
+        "provider": {
+          "$ref": "#/$defs/Provider"
+        },
+        "provider_repo_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The provider's own immutable opaque repository id (e.g. GitHub's numeric/node repository id), NOT owner/name text. For provider=local (no remote, dev/test flows): digest(first_commit_sha + normalized-absolute-init-path), itself then treated as an opaque string and never reopened by that path (resolves an open question two of the three source drafts left unresolved)."
+        },
+        "canonical_repo_key": {
+          "$ref": "#/$defs/ContentDigest",
+          "description": "digest(provider + provider_repo_id). The sole key for daemon service labels, locks, and cross-record repo identity (forecloses CRB-01: distinct repositories mapping to the same launchd/systemd label via sanitized owner/repo text)."
+        },
+        "full_name": {
+          "type": "string",
+          "pattern": "^[^/\\s]+/[^/\\s]+$",
+          "description": "owner/name. Advisory/display only -- rename/transfer-safe consumers key on canonical_repo_key, never on this string."
+        },
+        "default_branch": {
+          "$ref": "#/$defs/BranchName",
+          "description": "Accepts any valid provider branch name including names containing '/' (forecloses CRB-15's narrow-regex default-branch defect)."
+        }
+      }
+    },
+    "GitRefState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "base_sha",
+        "required_base_sha",
+        "head_sha",
+        "branch",
+        "pr",
+        "review_round"
+      ],
+      "properties": {
+        "base_sha": {
+          "$ref": "#/$defs/GitSha",
+          "description": "Exact default-branch SHA resolved and persisted at allocation time (CRB-15)."
+        },
+        "required_base_sha": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/GitSha"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional dependency-ordering ancestry requirement. When set, base_sha MUST be a descendant of this SHA, checked atomically (fetch remote default branch, resolve SHA, compare-and-swap) at allocation; allocation fails before any task/worktree/job is created if not (forecloses CRB-15)."
+        },
+        "head_sha": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/GitSha"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Exact immutable pushed head. null only pre-push (planning records); every review/verdict/gate record requires it non-null."
+        },
+        "branch": {
+          "$ref": "#/$defs/BranchName"
+        },
+        "pr": {
+          "$ref": "#/$defs/PullRequestRef"
+        },
+        "review_round": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Monotonic ordinal scoped to (repository, pr.number), assigned transactionally under the same allocation lock CRB-09 requires for worktree creation -- NOT a value the wire type alone makes race-free (see DESIGN.md decision log #7 and FIXTURES-PLAN.md for the required one-time backfill of gitmoot's existing string-typed review_round values, e.g. 'review-1' or a bare job.ID fallback, into this integer form). A VerdictRecord is pinned to an exact (head_sha, review_round) pair; a stale pair can never gate a newer head (forecloses CRB-09, CRB-14)."
+        }
+      }
+    },
+    "RosterIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "roster_id",
+        "roster_digest",
+        "profile_id",
+        "profile_digest",
+        "seat_id",
+        "seat_digest",
+        "kit_revision",
+        "kit_digest"
+      ],
+      "properties": {
+        "roster_id": {
+          "$ref": "#/$defs/Id",
+          "description": "Resolved from the selected roster mode to a stable id -- never re-read as an env var at execution time (forecloses CRB-02)."
+        },
+        "roster_digest": {
+          "$ref": "#/$defs/ContentDigest",
+          "description": "Digest of the fully-resolved roster definition at contract-persist time."
+        },
+        "profile_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "profile_digest": {
+          "$ref": "#/$defs/ContentDigest",
+          "description": "Digest of the resolved profile (model/effort/policy/capabilities)."
+        },
+        "seat_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "seat_digest": {
+          "$ref": "#/$defs/ContentDigest",
+          "description": "Digest of the seat's resolved command/script content, not a wrapper pathname (forecloses CRB-10: stale wrapper paths remaining dispatchable after re-adoption)."
+        },
+        "kit_revision": {
+          "$ref": "#/$defs/GitSha",
+          "description": "Council kit checkout commit the seat script was read from."
+        },
+        "kit_digest": {
+          "$ref": "#/$defs/ContentDigest",
+          "description": "Digest of the full kit tree consumed (templates, OMP yaml, lib/), not just the one seat file."
+        }
+      }
+    },
+    "BridgeProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profile_id",
+        "profile_digest",
+        "endpoint_digest"
+      ],
+      "properties": {
+        "profile_id": {
+          "$ref": "#/$defs/Id",
+          "description": "e.g. 'zai-glm', 'devin-kimi'. A Council-side profile that routes a registered RuntimeFamily adapter (today always 'claude' or 'codex') against a non-default API endpoint/backend model."
+        },
+        "profile_digest": {
+          "$ref": "#/$defs/ContentDigest"
+        },
+        "endpoint_digest": {
+          "$ref": "#/$defs/ContentDigest",
+          "description": "Digest of the resolved, non-default API base-URL/endpoint configuration actually bound for this attempt (e.g. ZAI_ANTHROPIC_BASE_URL). Makes an endpoint swap after validation structurally visible (R-12), the same way config_digest does for OMP config."
+        }
+      },
+      "description": "R-12's typed backend-capability contract for Council's real production bridge seats (council-zai-glm routes CLAUDE_BIN=claude against api.z.ai; council-devin-kimi is the analogous Devin-backed bridge). null on RuntimeIdentity.bridge_profile for a direct-provider attempt."
+    },
+    "RuntimeIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "runtime_family",
+        "model",
+        "effort",
+        "thinking_level",
+        "executable_digest",
+        "execution_mode",
+        "bridge_profile"
+      ],
+      "properties": {
+        "runtime_family": {
+          "$ref": "#/$defs/RuntimeFamily"
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Runtime-scoped model identifier as actually invoked. A free string bounded by shape only -- deliberately not a closed enum; the runtime-scoped model catalog changes faster than the protocol should need to (validated against a registered-model catalog at the adapter layer, not in this schema)."
+        },
+        "effort": {
+          "$ref": "#/$defs/EffortLevel"
+        },
+        "thinking_level": {
+          "$ref": "#/$defs/ThinkingLevel"
+        },
+        "executable_digest": {
+          "$ref": "#/$defs/ContentDigest",
+          "description": "Content digest of the actual runtime binary invoked for this attempt (never its pathname/inode alone)."
+        },
+        "execution_mode": {
+          "$ref": "#/$defs/ExecutionMode"
+        },
+        "bridge_profile": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/BridgeProfile"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "DigestClosure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "executable_digest",
+        "kit_digest",
+        "config_digest",
+        "credential_ref",
+        "dependency_digests"
+      ],
+      "properties": {
+        "executable_digest": {
+          "$ref": "#/$defs/ContentDigest"
+        },
+        "kit_digest": {
+          "$ref": "#/$defs/ContentDigest"
+        },
+        "config_digest": {
+          "$ref": "#/$defs/ContentDigest",
+          "description": "Digest of the fully-resolved OMP/roster/profile config content actually loaded, so a config pathname edited post-enqueue cannot affect an in-flight attempt (CRB-02)."
+        },
+        "credential_ref": {
+          "$ref": "#/$defs/CredentialRef"
+        },
+        "dependency_digests": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/NamedDigest"
+          },
+          "description": "Full interpreter/tool/shared-library/dependency closure (R-20): a copied script whose shebang still resolves ambient /usr/bin/env is not represented as hermetic here."
+        }
+      }
+    },
+    "OMPSemantics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "doer_model",
+        "advisor_model",
+        "advisor_enabled",
+        "advisor_required",
+        "backend_supports_split_thinking",
+        "shared_thinking_level",
+        "config_digest",
+        "binary_digest"
+      ],
+      "properties": {
+        "doer_model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "advisor_model": {
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "advisor_enabled": {
+          "type": "boolean",
+          "description": "Advisor process was initialized for this attempt."
+        },
+        "advisor_required": {
+          "type": "boolean",
+          "description": "Single canonical required-intervention flag, collapsing the two divergent knobs COUNCIL_OMP_ADVISOR_REQUIRED / COUNCIL_OMP_REQUIRE_ADVISOR (CRB-04)."
+        },
+        "backend_supports_split_thinking": {
+          "type": "boolean",
+          "description": "Whether the OMP backend can express independent doer/advisor reasoning levels. False for today's OMP (one global thinking flag)."
+        },
+        "shared_thinking_level": {
+          "$ref": "#/$defs/ThinkingLevel"
+        },
+        "doer_thinking_level": {
+          "$ref": "#/$defs/ThinkingLevel"
+        },
+        "advisor_thinking_level": {
+          "$ref": "#/$defs/ThinkingLevel"
+        },
+        "config_digest": {
+          "$ref": "#/$defs/ContentDigest"
+        },
+        "binary_digest": {
+          "$ref": "#/$defs/ContentDigest"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "backend_supports_split_thinking": {
+                "const": false
+              }
+            },
+            "required": [
+              "backend_supports_split_thinking"
+            ]
+          },
+          "then": {
+            "properties": {
+              "doer_thinking_level": false,
+              "advisor_thinking_level": false
+            },
+            "description": "When the backend cannot split effort, doer/advisor thinking fields must be structurally ABSENT (not merely equal) -- there is nowhere in the document for two different levels to be written at all, so CRB-04's exact contradiction ('COUNCIL_OMP_THINKING=high' vs OMP YAML 'medium') is unrepresentable rather than merely undetected."
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "advisor_required": {
+                "const": true
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "advisor_enabled": {
+                "const": true
+              }
+            }
+          },
+          "description": "Intervention cannot be required from an advisor that was never initialized."
+        },
+        {
+          "if": {
+            "properties": {
+              "advisor_enabled": {
+                "const": false
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "advisor_model": {
+                "const": null
+              }
+            }
+          }
+        }
+      ]
+    },
+    "AdvisorInteractionRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "advisor_initialized",
+        "advisor_intervened",
+        "interaction_count"
+      ],
+      "properties": {
+        "advisor_initialized": {
+          "type": "boolean"
+        },
+        "advisor_intervened": {
+          "type": "boolean",
+          "description": "True only on a backend-produced typed receipt of an actual intervention -- never derived from counting a marker string in untrusted log output (forecloses CRB-05's `grep -c ... || echo 0` -> \"0\\n0\" defect: there is no free-text count field anywhere in this schema for that bug class to live in)."
+        },
+        "interaction_count": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "ProcessIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "host_id",
+        "pid",
+        "process_start_identity",
+        "process_group_id"
+      ],
+      "properties": {
+        "host_id": {
+          "$ref": "#/$defs/Id",
+          "description": "Stable machine identity, not hostname alone (hostnames collide/change)."
+        },
+        "pid": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "process_start_identity": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Platform-native unforgeable start-time token: Linux /proc/<pid>/stat starttime (jiffies since boot) + boot id, or Darwin KERN_PROC start-time + session/pgid. Opaque to this schema; used to detect a PID recycled by an unrelated process after the real writer exited (CRB-12: 'children may fork, reparent, or survive SIGKILL of the launcher')."
+        },
+        "process_group_id": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "DelegationGrant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "record_id",
+        "record_type",
+        "issued_by",
+        "issued_at",
+        "grant_id",
+        "task_id",
+        "attempt_id",
+        "issuer_attempt_id",
+        "allowed",
+        "permitted_actions",
+        "permitted_target_kinds",
+        "permitted_runtime_families",
+        "repo_scope",
+        "branch_scope",
+        "worktree_scope",
+        "max_autonomy_policy",
+        "implementation_delegatable",
+        "unrestricted_delegatable",
+        "max_depth",
+        "max_width",
+        "max_wall_time_seconds",
+        "max_tokens",
+        "max_cost_usd_cents",
+        "budget_snapshot",
+        "grant_digest",
+        "expires_at"
+      ],
+      "properties": {
+        "protocol_version": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "record_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "record_type": {
+          "const": "delegation_grant"
+        },
+        "issued_by": {
+          "const": "gitmoot-core"
+        },
+        "issued_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "grant_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "task_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "attempt_id": {
+          "$ref": "#/$defs/Id",
+          "description": "The attempt this grant is the ceiling FOR (the child, or the root if issuer_attempt_id is null)."
+        },
+        "issuer_attempt_id": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The delegating parent attempt whose own grant this was carved from, or null for a root attempt's grant (issued directly from operator/profile policy)."
+        },
+        "allowed": {
+          "type": "boolean"
+        },
+        "permitted_actions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DelegationAction"
+          },
+          "uniqueItems": true
+        },
+        "permitted_target_kinds": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "named_agent",
+              "ephemeral"
+            ]
+          },
+          "uniqueItems": true
+        },
+        "permitted_runtime_families": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RuntimeFamily"
+          },
+          "uniqueItems": true
+        },
+        "repo_scope": {
+          "$ref": "#/$defs/ContentDigest",
+          "description": "digest of the canonical_repo_key set this grant may act within."
+        },
+        "branch_scope": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/BranchName"
+          },
+          "description": "Empty = no branch may be written; non-empty = exact allowed branch name(s)/prefix(es)."
+        },
+        "worktree_scope": {
+          "type": "string",
+          "enum": [
+            "none",
+            "read_only_view",
+            "exclusive_writer"
+          ]
+        },
+        "max_autonomy_policy": {
+          "$ref": "#/$defs/AutonomyPolicy"
+        },
+        "implementation_delegatable": {
+          "type": "boolean"
+        },
+        "unrestricted_delegatable": {
+          "type": "boolean",
+          "description": "Whether this holder may grant danger_full_access to a child. Default false for every ask/review-only agent."
+        },
+        "max_depth": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_width": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Max sibling delegations at one level."
+        },
+        "max_wall_time_seconds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_cost_usd_cents": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "budget_snapshot": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "tokens_spent_before",
+            "cost_usd_cents_spent_before",
+            "width_used_before"
+          ],
+          "properties": {
+            "tokens_spent_before": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "cost_usd_cents_spent_before": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "width_used_before": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "description": "Cumulative spend against root_id's delegation tree BEFORE this grant, folded by the core over every prior DelegationGrant sharing root_id at issuance time. Answers the audit's uncovered 14th concern (a ceiling alone does not stop repeated re-requesting from exceeding a tree-wide budget) without a separate ledger record kind -- the running total is always re-derivable from existing DelegationGrant rows."
+        },
+        "grant_digest": {
+          "$ref": "#/$defs/ContentDigest",
+          "description": "digest of this grant's canonicalized content. A child's grant is verified server-side to be a field-for-field subset of the parent's grant (by attempt_id lookup, not by a caller-echoed digest) at BOTH result-advancement time and immediately before daemon materialization (CRB-16's two-checkpoint requirement) -- this subset check is a cross-record engine invariant, not expressible as a single-instance JSON Schema constraint; see DESIGN.md decision log #4."
+        },
+        "expires_at": {
+          "$ref": "#/$defs/Timestamp"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "allowed": {
+                "const": false
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "permitted_actions": {
+                "const": []
+              },
+              "permitted_target_kinds": {
+                "const": []
+              }
+            }
+          },
+          "description": "A denied grant cannot smuggle a non-empty action or target set (CRB-16 negative path: an ask-only agent reaching dispatchDelegations at all becomes syntactically impossible)."
+        },
+        {
+          "if": {
+            "properties": {
+              "implementation_delegatable": {
+                "const": false
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "permitted_actions": {
+                "type": "array",
+                "items": {
+                  "enum": [
+                    "ask",
+                    "review"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "unrestricted_delegatable": {
+                "const": false
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "max_autonomy_policy": {
+                "enum": [
+                  "read_only",
+                  "workspace_write"
+                ]
+              }
+            }
+          },
+          "description": "danger_full_access is structurally excluded from the holder's own delegatable ceiling unless explicitly unlocked."
+        }
+      ],
+      "description": "FIELD GROUP 8. Core-issued, immutable, 1:1 with attempt_id. Every child a holder delegates must be a subset of both this grant and operator/profile policy (validated server-side, see grant_digest description and DESIGN.md decision log #4, which also records why this synthesis DROPS the two source drafts' seat-held signature/attestation mechanisms as unnecessary net-new cryptographic infrastructure)."
+    },
+    "WriterLease": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "record_id",
+        "record_type",
+        "issued_by",
+        "issued_at",
+        "lease_id",
+        "task_id",
+        "worktree_id",
+        "holder_attempt_id",
+        "fencing_token",
+        "state",
+        "process",
+        "acquired_at",
+        "expires_at",
+        "heartbeat_at",
+        "reclaimed_from_lease_id",
+        "deadline"
+      ],
+      "properties": {
+        "protocol_version": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "record_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "record_type": {
+          "const": "writer_lease"
+        },
+        "issued_by": {
+          "const": "gitmoot-core"
+        },
+        "issued_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "lease_id": {
+          "$ref": "#/$defs/Id",
+          "description": "Stable across a lease's own acquire/renew/release/expire/reclaim transitions; each transition is a NEW WriterLease record sharing this lease_id (append-only -- there is no in-place update)."
+        },
+        "task_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "worktree_id": {
+          "$ref": "#/$defs/Id",
+          "description": "Never a raw filesystem path -- a worktree path is mutable/reassignable; its id is not."
+        },
+        "holder_attempt_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "fencing_token": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Strictly increasing per (task_id, worktree_id); never reused, never decreases across recovery, and doubles as this record's append-only order key within that scope. Any component asked to accept a write (git push, DB commit, provider mutation) MUST reject a fencing_token lower than the highest it has already observed for that (task_id, worktree_id) -- the standard fencing-token pattern, which is what makes CRB-12's orphaned writer harmless even if it eventually wakes up and tries to finalize."
+        },
+        "state": {
+          "type": "string",
+          "enum": [
+            "held",
+            "released",
+            "expired",
+            "reclaimed"
+          ]
+        },
+        "process": {
+          "$ref": "#/$defs/ProcessIdentity"
+        },
+        "acquired_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "expires_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "heartbeat_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "reclaimed_from_lease_id": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The prior lease_id this record supersedes. Required non-null when state=reclaimed so an orphan-recovery event always has full lineage (CRB-12 acceptance: 'exactly one deterministic recovery outcome is recorded')."
+        },
+        "deadline": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "caller_deadline_seconds",
+            "backend_timeout_seconds",
+            "on_expiry_policy",
+            "deadline_at"
+          ],
+          "properties": {
+            "caller_deadline_seconds": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "backend_timeout_seconds": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "on_expiry_policy": {
+              "type": "string",
+              "enum": [
+                "fail_closed_block",
+                "escalate_human",
+                "auto_retry"
+              ]
+            },
+            "deadline_at": {
+              "$ref": "#/$defs/Timestamp"
+            }
+          },
+          "description": "FIELD GROUP 9. caller_deadline_seconds (e.g. an interactive council-run's patience) and backend_timeout_seconds (e.g. the OMP seat's independent `timeout --foreground`) are separate fields on purpose so CRB-12's exact observed mismatch (3600s vs 5400s, disagreeing, discovered live) is visible in the contract before launch. The core MUST reject a lease where backend_timeout_seconds > caller_deadline_seconds before enqueue; JSON Schema 2020-12 has no `$data` keyword to express that cross-field inequality natively, so it is enforced by the generated consumer, not this schema alone (documented, not a silent gap -- see DESIGN.md decision log #5)."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "reclaimed"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "reclaimed_from_lease_id": {
+                "$ref": "#/$defs/Id"
+              }
+            },
+            "required": [
+              "reclaimed_from_lease_id"
+            ]
+          }
+        }
+      ],
+      "description": "FIELD GROUP 9/10 (deadline + writer/supervisor lease fencing). Exactly one exclusive writer lease per (task_id, worktree_id) at a time; a second writer must be rejected until the highest fencing_token record for that scope shows state in {released, expired-and-reclaimed}. Reviews never hold or require a WriterLease (they key off head_sha alone -- see GitRefState/VerdictRecord), so CRB-09's race is never contended by a reviewer, only by a genuine second writer."
+    },
+    "EphemeralSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "runtime"
+      ],
+      "properties": {
+        "runtime": {
+          "$ref": "#/$defs/EphemeralRuntimeFamily"
+        },
+        "requested_model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "requested_effort": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/EffortLevel"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "template": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "capabilities": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "requested_autonomy_policy": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/AutonomyPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "description": "Matches internal/prompts/contract_generated.go's delegationSchemaHelp EphemeralSpec fields exactly. All requested_* fields are HINTS ONLY -- never authoritative. The materialized child's effective identity is whatever its own ExecutionContract says, resolved by gitmoot-core against the issuing DelegationGrant's ceiling, never against these hints directly."
+    },
+    "TypedChange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "change_kind",
+        "content_digest"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "change_kind": {
+          "type": "string",
+          "enum": [
+            "add",
+            "modify",
+            "delete",
+            "rename",
+            "copy"
+          ]
+        },
+        "content_digest": {
+          "$ref": "#/$defs/ContentDigest",
+          "description": "Digest of the post-change content (pre-change for delete) -- not diff text, so it survives whitespace-insensitive re-hashing."
+        },
+        "diff_artifact_id": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "artifact_id of a stored unified-diff ArtifactRef."
+        }
+      }
+    },
+    "TypedCommand": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "argv",
+        "cwd",
+        "started_at",
+        "ended_at",
+        "exit_status",
+        "termination_signal",
+        "stdout_artifact_id",
+        "stderr_artifact_id"
+      ],
+      "properties": {
+        "argv": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "description": "Exact argv, not a shell string. A pipelined/composed command is represented as one sh -c \"...\" argv[0]/argv[1] pair by the producing wrapper -- this schema does not add a separate shell:bool escape hatch (kept simple; see DESIGN.md decision log #6)."
+        },
+        "cwd": {
+          "type": "string",
+          "minLength": 1
+        },
+        "started_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "ended_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "exit_status": {
+          "type": "integer"
+        },
+        "termination_signal": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "stdout_artifact_id": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "stderr_artifact_id": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "description": "Replaces free-text 'tests_run: [\"go test ./...\"]' strings. A claimed test is this record with exit_status==0; a non-zero exit_status here cannot be overridden by summary prose (CRB-06 acceptance #2). This exact instrumentation does not exist in any current seat script and is new engineering, not incidental to the schema -- see FIXTURES-PLAN.md."
+    },
+    "TypedFinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "severity",
+        "message",
+        "evidence_artifact_id"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "severity": {
+          "type": "string",
+          "enum": [
+            "blocking",
+            "major",
+            "minor",
+            "info"
+          ]
+        },
+        "file": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "line": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1
+        },
+        "evidence_artifact_id": {
+          "$ref": "#/$defs/Id",
+          "description": "changes_requested MUST carry >=1 TypedFinding with a bound artifact (forecloses CRB-06's evidence-free changes_requested)."
+        }
+      }
+    },
+    "TypedNeed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "description"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "missing_credential",
+            "missing_dependency",
+            "human_decision",
+            "external_blocker",
+            "gate"
+          ]
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1
+        },
+        "gate_ref": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "TypedDelegation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "action",
+        "prompt"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^\\S+$",
+          "description": "Unique within this batch; deps[] reference it."
+        },
+        "agent": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "ephemeral": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/EphemeralSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "action": {
+          "$ref": "#/$defs/DelegationAction"
+        },
+        "worktree": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Requested worktree path HINT only; the child's actual worktree grant lives in its own DelegationGrant.worktree_scope, resolved server-side."
+        },
+        "prompt": {
+          "type": "string",
+          "minLength": 1,
+          "description": "What the agent should do. Required -- matches gitmoot's real, currently-enforced validateAgentResult rule ('prompt is required') exactly. Dropping this field (as two of the three source drafts did) is a functional regression: a delegated child would receive no task description."
+        },
+        "artifact_refs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Id"
+          }
+        },
+        "deps": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "timeout_seconds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "retry": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "failure_policy": {
+          "type": "string",
+          "enum": [
+            "block_parent",
+            "continue",
+            "escalate",
+            "escalate_human"
+          ]
+        },
+        "fingerprint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "synthesis_rule": {
+          "type": "string",
+          "enum": [
+            "summary",
+            "vote",
+            "quorum",
+            "verify"
+          ]
+        },
+        "quorum": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "requested_model": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Hint only, never authoritative -- see EphemeralSpec note."
+        },
+        "requested_effort": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/EffortLevel"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "phase": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "synthesis_rule": {
+                "const": "quorum"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "quorum"
+            ]
+          }
+        }
+      ],
+      "description": "Exactly one of agent or ephemeral must be set (enforced by the generated binding, matching gitmoot's existing Delegation.Agent/Ephemeral either/or shape). This record deliberately carries NO grant digest, signature, or attestation field from the untrusted seat -- see DelegationGrant description and DESIGN.md decision log #4 for why the two-checkpoint CRB-16 authority check is entirely server-side and needs no caller-presented credential on this record at all."
+    },
+    "HumanQuestion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "prompt"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "prompt": {
+          "type": "string",
+          "minLength": 1
+        },
+        "choices": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "Learning": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "content"
+      ],
+      "properties": {
+        "key": {
+          "type": "string",
+          "minLength": 1
+        },
+        "scope": {
+          "type": "string",
+          "enum": [
+            "repo",
+            "general"
+          ]
+        },
+        "content": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "ExecutionContract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "record_id",
+        "record_type",
+        "issued_by",
+        "issued_at",
+        "identity",
+        "repository",
+        "git_ref",
+        "roster",
+        "runtime",
+        "digests",
+        "omp",
+        "persisted_at",
+        "contract_digest"
+      ],
+      "properties": {
+        "protocol_version": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "record_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "record_type": {
+          "const": "execution_contract"
+        },
+        "issued_by": {
+          "const": "gitmoot-core"
+        },
+        "issued_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "identity": {
+          "$ref": "#/$defs/IdentitySpine"
+        },
+        "repository": {
+          "$ref": "#/$defs/RepositoryIdentity"
+        },
+        "git_ref": {
+          "$ref": "#/$defs/GitRefState"
+        },
+        "roster": {
+          "$ref": "#/$defs/RosterIdentity"
+        },
+        "runtime": {
+          "$ref": "#/$defs/RuntimeIdentity"
+        },
+        "digests": {
+          "$ref": "#/$defs/DigestClosure"
+        },
+        "omp": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/OMPSemantics"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Required non-null whenever the seat is OMP-backed; null for a plain ask/review/implement seat with no doer/advisor split."
+        },
+        "persisted_at": {
+          "$ref": "#/$defs/Timestamp",
+          "description": "Strictly before the job is enqueued (CRB-02: 'immutable execution contract persisted before enqueue')."
+        },
+        "contract_digest": {
+          "$ref": "#/$defs/ContentDigest",
+          "description": "digest computed over this record's canonicalized bytes AFTER persistence and stored alongside it (hash-then-store, not self-referential -- deliberately different from the rejected commit-contains-its-own-SHA design, \u00a76.13). Every later record for this attempt_id (ExecutionRecord.matches_contract_digest, DelegationGrant) references this value."
+        }
+      },
+      "description": "FIELD GROUPS 1-7 assembled. The single immutable, pre-enqueue launch artifact. DelegationGrant, WriterLease, and every downstream execution/check/verdict/advancement/provider-effect record REFERENCE this contract by identity rather than being folded into it, so a downstream failure in any one of them can never mutate what was true at launch time (direct structural fix for CRB-13)."
+    },
+    "CouncilResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "record_id",
+        "record_type",
+        "issued_by",
+        "issued_at",
+        "identity",
+        "contract_digest",
+        "decision",
+        "summary",
+        "typed_changes",
+        "typed_commands",
+        "typed_findings",
+        "typed_needs",
+        "delegations",
+        "artifact_refs",
+        "human_questions",
+        "learnings"
+      ],
+      "properties": {
+        "protocol_version": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "record_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "record_type": {
+          "const": "council_result"
+        },
+        "issued_by": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The untrusted seat/agent name that produced this record (NOT 'gitmoot-core' -- this is the ONE record kind in the protocol that is model/seat-authored, and it is never treated as authoritative on its own: VerdictRecord is the core-validated projection that carries authority, ResultCheckRecord gates whether this record's evidence may even reach review/gate)."
+        },
+        "issued_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "identity": {
+          "$ref": "#/$defs/IdentitySpine"
+        },
+        "contract_digest": {
+          "$ref": "#/$defs/ContentDigest",
+          "description": "The ExecutionContract.contract_digest this attempt executed under -- lets the core detect a result reported against the wrong/stale contract."
+        },
+        "decision": {
+          "$ref": "#/$defs/DecisionValue"
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Human-readable only. MUST NOT be parsed by any control-flow path (coding rule 5) -- no grep/awk/regex over this field may ever gate branch, PR, repair, retry, gate, or continuation behavior. Its presence/non-emptiness is validated; its CONTENT is never authority. (The real, currently-shipping regression this guards against: kit/bin/council-continue-seat's existing regex scans exactly a summary-adjacent text blob for routing today -- a P0-3 static check should grep adapter source for this pattern; see FIXTURES-PLAN.md.)"
+        },
+        "typed_changes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TypedChange"
+          }
+        },
+        "typed_commands": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TypedCommand"
+          }
+        },
+        "typed_findings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TypedFinding"
+          }
+        },
+        "typed_needs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TypedNeed"
+          }
+        },
+        "delegations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TypedDelegation"
+          }
+        },
+        "artifact_refs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Id"
+          }
+        },
+        "human_questions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/HumanQuestion"
+          }
+        },
+        "learnings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Learning"
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "decision": {
+                "const": "implemented"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "typed_changes": {
+                "minItems": 1
+              },
+              "typed_commands": {
+                "minItems": 1
+              }
+            }
+          },
+          "description": "CRB-06: decision=implemented with empty typed_changes/typed_commands is schema-invalid, not merely policy-warned."
+        },
+        {
+          "if": {
+            "properties": {
+              "decision": {
+                "const": "changes_requested"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "typed_findings": {
+                "minItems": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "decision": {
+                "const": "blocked"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "typed_needs": {
+                "minItems": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "decision": {
+                "const": "skipped"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "delegations": {
+                "maxItems": 0
+              }
+            }
+          },
+          "description": "Byte-identical to gitmoot's real, currently-enforced rule (validateAgentResult: 'decision skipped cannot be used with delegations')."
+        }
+      ],
+      "description": "FIELD GROUPS 10 (partial) + evidence half of 11-12. THE ONLY record kind an untrusted model/seat authors. Typed replacement for the free-text gitmoot_result envelope in internal/prompts/contract_generated.go; council.sh's current unconditional empty-list emission (result[\"changes_made\"]=[] etc. for every seat) is schema-illegal here whenever decision requires non-empty evidence. It is evidence, never a verdict: nothing reads council_result.decision as binding workflow authority by itself."
+    },
+    "ExecutionRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "record_id",
+        "record_type",
+        "issued_by",
+        "issued_at",
+        "identity",
+        "execution_state",
+        "process",
+        "observed_runtime",
+        "observed_omp",
+        "started_at",
+        "ended_at",
+        "exit_status",
+        "termination_signal",
+        "omp_advisor_interaction",
+        "concurrency_probe",
+        "head_before_sha",
+        "head_after_sha",
+        "stdout_artifact_id",
+        "stderr_artifact_id",
+        "contract_digest",
+        "matches_contract_digest"
+      ],
+      "properties": {
+        "protocol_version": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "record_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "record_type": {
+          "const": "execution_record"
+        },
+        "issued_by": {
+          "const": "gitmoot-core"
+        },
+        "issued_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "identity": {
+          "$ref": "#/$defs/IdentitySpine"
+        },
+        "execution_state": {
+          "type": "string",
+          "enum": [
+            "queued",
+            "running",
+            "succeeded",
+            "failed",
+            "killed",
+            "cancelled"
+          ],
+          "description": "Model/process execution truth ONLY, independent of verdict/result-check/advancement state (forecloses CRB-13)."
+        },
+        "process": {
+          "$ref": "#/$defs/ProcessIdentity"
+        },
+        "observed_runtime": {
+          "$ref": "#/$defs/RuntimeIdentity",
+          "description": "What actually ran, attested by the launch supervisor -- never self-reported by the model."
+        },
+        "observed_omp": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/OMPSemantics"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "started_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "ended_at": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "exit_status": {
+          "oneOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "termination_signal": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "omp_advisor_interaction": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/AdvisorInteractionRecord"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "concurrency_probe": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "platform",
+                "ram_bytes_observed",
+                "chosen_concurrency"
+              ],
+              "properties": {
+                "platform": {
+                  "type": "string",
+                  "enum": [
+                    "linux",
+                    "darwin"
+                  ]
+                },
+                "ram_bytes_observed": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "chosen_concurrency": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              },
+              "description": "Records the typed platform RAM probe actually used (sysctl hw.memsize on Darwin, /proc/meminfo on Linux), foreclosing CRB-11's silent zero-RAM collapse to a hardcoded minimum."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "head_before_sha": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/GitSha"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "head_after_sha": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/GitSha"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "stdout_artifact_id": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "stderr_artifact_id": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "contract_digest": {
+          "$ref": "#/$defs/ContentDigest"
+        },
+        "matches_contract_digest": {
+          "type": "boolean",
+          "description": "Core-computed: true iff observed_runtime/observed_omp are field-for-field equal to the ExecutionContract's declared runtime/omp. False is a hard-fail condition upstream of any decision text (CRB-02 acceptance #5: 'reject any attempt whose effective identity does not match the persisted contract')."
+        }
+      },
+      "description": "FIELD GROUP 11a. Never claim a model/config/effort ran without this record (coding rule 17)."
+    },
+    "ResultCheckRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "record_id",
+        "record_type",
+        "issued_by",
+        "issued_at",
+        "attempt_id",
+        "source_council_result_record_id",
+        "result_check_state",
+        "policy_mode",
+        "checks",
+        "checked_at"
+      ],
+      "properties": {
+        "protocol_version": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "record_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "record_type": {
+          "const": "result_check_record"
+        },
+        "issued_by": {
+          "const": "gitmoot-core"
+        },
+        "issued_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "attempt_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "source_council_result_record_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "result_check_state": {
+          "type": "string",
+          "enum": [
+            "pending",
+            "passed",
+            "failed"
+          ]
+        },
+        "policy_mode": {
+          "type": "string",
+          "enum": [
+            "warn",
+            "block"
+          ],
+          "description": "Explicit, per-attempt, core-enforced. 'block' means artifact preparation is impossible on failure (CRB-06 requirement); replaces today's silent Council-emits-empty-evidence vs Gitmoot-warns-only mismatch. Strict/'block' is the schema default policy_mode gitmoot-core assigns once a conformant CouncilResult producer exists (see FIXTURES-PLAN.md migration window)."
+        },
+        "checks": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "changes_made_nonempty",
+            "tests_run_nonempty",
+            "findings_required_and_present",
+            "needs_required_and_present"
+          ],
+          "properties": {
+            "changes_made_nonempty": {
+              "type": "boolean"
+            },
+            "tests_run_nonempty": {
+              "type": "boolean"
+            },
+            "findings_required_and_present": {
+              "type": "boolean"
+            },
+            "needs_required_and_present": {
+              "type": "boolean"
+            }
+          }
+        },
+        "checked_at": {
+          "$ref": "#/$defs/Timestamp"
+        }
+      },
+      "description": "FIELD GROUP 11b. Booleans are computed by gitmoot-core from the CouncilResult's typed_* arrays -- never from a word count over an untrusted log (CRB-05's bug class structurally excluded)."
+    },
+    "VerdictRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "record_id",
+        "record_type",
+        "issued_by",
+        "issued_at",
+        "attempt_id",
+        "source_council_result_record_id",
+        "decision",
+        "produced_by",
+        "decision_digest",
+        "head_sha",
+        "review_round",
+        "immutable"
+      ],
+      "properties": {
+        "protocol_version": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "record_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "record_type": {
+          "const": "verdict_record"
+        },
+        "issued_by": {
+          "const": "gitmoot-core"
+        },
+        "issued_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "attempt_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "source_council_result_record_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "decision": {
+          "$ref": "#/$defs/DecisionValue"
+        },
+        "produced_by": {
+          "$ref": "#/$defs/RuntimeIdentity",
+          "description": "The runtime identity that actually produced this vote -- an execution receipt, not a claimed roster entry (CRB-02)."
+        },
+        "decision_digest": {
+          "$ref": "#/$defs/ContentDigest",
+          "description": "Digest of the exact CouncilResult content this verdict was extracted from; tamper-evident and independently re-derivable."
+        },
+        "head_sha": {
+          "$ref": "#/$defs/GitSha",
+          "description": "The exact head this verdict is bound to (CRB-14): a verdict does not silently re-bind when the writer produces a new head."
+        },
+        "review_round": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Paired with head_sha; a stale (head_sha, review_round) pair can never gate a newer head."
+        },
+        "immutable": {
+          "const": true,
+          "description": "Once written, a verdict is never updated or deleted; it remains valid and usable even if a later AdvancementRecord for the same attempt fails (forecloses CRB-13's acceptance proof)."
+        }
+      },
+      "description": "FIELD GROUP 11c."
+    },
+    "CiObservationRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "record_id",
+        "record_type",
+        "issued_by",
+        "issued_at",
+        "repository_key",
+        "pr_number",
+        "head_sha",
+        "observed_at",
+        "external_status_count",
+        "external_checkrun_count"
+      ],
+      "properties": {
+        "protocol_version": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "record_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "record_type": {
+          "const": "ci_observation_record"
+        },
+        "issued_by": {
+          "const": "gitmoot-core"
+        },
+        "issued_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "repository_key": {
+          "$ref": "#/$defs/ContentDigest",
+          "description": "RepositoryIdentity.canonical_repo_key."
+        },
+        "pr_number": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "head_sha": {
+          "$ref": "#/$defs/GitSha"
+        },
+        "observed_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "external_status_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "external_checkrun_count": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "description": "Append-only raw observation, one row per merge-gate evaluation. Mirrors gitmoot's real, already-shipped merge_gate_ci_observations invariant (store.go #596: the gate must see a SECOND consecutive zero-external observation at the SAME head, at least min_ci_wait after the first, before concluding 'no CI' -- closing the race where a fresh head merges before a check run is created). This synthesis models the raw observations as append-only records; the two-consecutive-zero derivation is an engine-side fold over consecutive CiObservationRecord rows for one head_sha, stamped as GateIntentRecord.ci_state (added because none of the three source drafts modeled this already-shipped gitmoot invariant at all -- see critique-completeness.md finding 2.2)."
+    },
+    "GateIntentRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "record_id",
+        "record_type",
+        "issued_by",
+        "issued_at",
+        "task_id",
+        "repository_key",
+        "pr",
+        "base_sha",
+        "head_sha",
+        "review_round",
+        "verdict_record_ids",
+        "ci_state",
+        "ci_observation_record_ids",
+        "requested_policy",
+        "gate_intent_digest"
+      ],
+      "properties": {
+        "protocol_version": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "record_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "record_type": {
+          "const": "gate_intent_record"
+        },
+        "issued_by": {
+          "const": "gitmoot-core"
+        },
+        "issued_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "task_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "repository_key": {
+          "$ref": "#/$defs/ContentDigest"
+        },
+        "pr": {
+          "$ref": "#/$defs/PullRequestRef"
+        },
+        "base_sha": {
+          "$ref": "#/$defs/GitSha"
+        },
+        "head_sha": {
+          "$ref": "#/$defs/GitSha"
+        },
+        "review_round": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "verdict_record_ids": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Id"
+          },
+          "minItems": 1,
+          "description": "The exact set of VerdictRecord.record_id this gate evaluation is about to act on -- durably committed BEFORE gate execution."
+        },
+        "ci_state": {
+          "type": "string",
+          "enum": [
+            "unknown",
+            "ci_present",
+            "no_ci_confirmed"
+          ]
+        },
+        "ci_observation_record_ids": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Id"
+          }
+        },
+        "requested_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "min_approvals",
+            "quorum_rule",
+            "required_seat_ids"
+          ],
+          "properties": {
+            "min_approvals": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "quorum_rule": {
+              "type": "string",
+              "enum": [
+                "all_required",
+                "any_veto_blocks",
+                "k_of_n"
+              ]
+            },
+            "required_seat_ids": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Id"
+              }
+            }
+          }
+        },
+        "gate_intent_digest": {
+          "$ref": "#/$defs/ContentDigest",
+          "description": "digest of this record's own canonicalized content. A gate process killed after persisting this record but before a verdict/advancement exists MUST replay against this exact digest on restart, never reconstruct intent from prompt/summary text (forecloses CRB-07's core failure: 'gate input/intent is not durably committed before gate execution')."
+        }
+      },
+      "description": "NEW record kind (absent from all three source drafts -- CRB-07's literal required change, 'persist a gate intent containing exact review receipts, CI observation, PR/head/base identity, and requested policy... before execution', was named by name in the audit but never modeled as its own record by any draft; see critique-completeness.md finding 2.1). AdvancementRecord.gate_intent_record_id references this."
+    },
+    "AdvancementRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "record_id",
+        "record_type",
+        "issued_by",
+        "issued_at",
+        "task_id",
+        "sequence",
+        "triggering_record_id",
+        "gate_intent_record_id",
+        "advance_state",
+        "target_transition",
+        "evaluated_at"
+      ],
+      "properties": {
+        "protocol_version": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "record_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "record_type": {
+          "const": "advancement_record"
+        },
+        "issued_by": {
+          "const": "gitmoot-core"
+        },
+        "issued_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "task_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Monotonic ordinal scoped to task_id. This record kind is append-only -- a new AdvancementRecord per evaluation, never an updated row; 'current' advance_state is the row with the highest sequence for a task_id. retry_count is len(records with advance_state=retryable) for this task_id, derivable by fold rather than stored redundantly."
+        },
+        "triggering_record_id": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The VerdictRecord.record_id or GateIntentRecord.record_id this evaluation consumed, or null for the first pending evaluation of a fresh gate_intent."
+        },
+        "gate_intent_record_id": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "advance_state": {
+          "type": "string",
+          "enum": [
+            "pending",
+            "advanced",
+            "retryable",
+            "blocked",
+            "failed"
+          ],
+          "description": "Workflow fanout/continuation truth ONLY, independent of execution_state and verdict decision (CRB-13)."
+        },
+        "target_transition": {
+          "type": "string",
+          "enum": [
+            "dispatch_review",
+            "create_repair",
+            "create_retry",
+            "merge",
+            "terminate",
+            "await_human",
+            "none"
+          ],
+          "description": "Typed next-step, not a coordinator-reconstructed decision from prompt/summary text (forecloses CRB-07's repair-routing-via-summary-reconstruction defect)."
+        },
+        "evaluated_at": {
+          "$ref": "#/$defs/Timestamp"
+        }
+      },
+      "description": "FIELD GROUP 11d. A gate process killed before any AdvancementRecord exists for a gate_intent_record_id MUST replay that identical gate_intent (see GateIntentRecord.gate_intent_digest); killed after one exists, it resumes from the highest-sequence record without rerunning valid votes (CRB-07 acceptance proof)."
+    },
+    "RepairRequestRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "record_id",
+        "record_type",
+        "issued_by",
+        "issued_at",
+        "task_id",
+        "prior_attempt_id",
+        "new_attempt_id",
+        "finding_ids",
+        "expected_head_before",
+        "reused_branch",
+        "reused_worktree_id",
+        "requested_by_attempt_id",
+        "created_at"
+      ],
+      "properties": {
+        "protocol_version": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "record_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "record_type": {
+          "const": "repair_request_record"
+        },
+        "issued_by": {
+          "const": "gitmoot-core"
+        },
+        "issued_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "task_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "prior_attempt_id": {
+          "$ref": "#/$defs/Id",
+          "description": "The reviewed implement attempt this repair answers."
+        },
+        "new_attempt_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "finding_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1,
+          "description": "The specific TypedFinding.id values (from the VerdictRecord's underlying CouncilResult) this repair attempt is authorized to answer. A repair issued against a stale or wrong finding set is a structural mismatch a consumer can detect (forecloses CRB-08's gap: task/attempt ancestry alone proves 'another attempt of the same task', not 'this attempt answers findings F1..Fn')."
+        },
+        "expected_head_before": {
+          "$ref": "#/$defs/GitSha",
+          "description": "The head the new attempt's writer worktree MUST start from; a mismatch is rejected before the repair worktree materializes."
+        },
+        "reused_branch": {
+          "$ref": "#/$defs/BranchName",
+          "description": "The existing implementation branch, reused in place (CRB-08: repair must reuse the existing task branch/worktree under an exclusive lease, never Council's current -vN new-branch versioning)."
+        },
+        "reused_worktree_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "requested_by_attempt_id": {
+          "$ref": "#/$defs/Id",
+          "description": "The gate/coordinator attempt that authorized this repair."
+        },
+        "created_at": {
+          "$ref": "#/$defs/Timestamp"
+        }
+      },
+      "description": "NEW record kind (absent from all three source drafts -- CRB-08's literal required-change list: 'accepts immutable findings/receipt IDs; reuses the existing task branch and writer worktree under an exclusive lease; verifies exact PR/head/task ancestry; records head-before and expected head; preserves review/gate ancestry', restated as \u00a79 Gate&Repair acceptance #4; see critique-completeness.md finding 2.3). A WriterLease for reused_worktree_id must be acquired under new_attempt_id before any repair commit is possible."
+    },
+    "ProviderEffectIntent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "record_id",
+        "record_type",
+        "issued_by",
+        "issued_at",
+        "idempotency_key",
+        "effect_type",
+        "repository_key",
+        "target",
+        "requested_by_attempt_id",
+        "payload_digest"
+      ],
+      "properties": {
+        "protocol_version": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "record_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "record_type": {
+          "const": "provider_effect_intent"
+        },
+        "issued_by": {
+          "const": "gitmoot-core"
+        },
+        "issued_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "idempotency_key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "description": "Core-derived deterministic key over (effect_type, repository_key, target, requested_by_attempt_id, payload_digest). A crash-and-retry of the same intent is a provider-side no-op on replay, never a duplicate PR comment or a double merge."
+        },
+        "effect_type": {
+          "type": "string",
+          "enum": [
+            "pr_create",
+            "pr_comment",
+            "pr_update",
+            "merge",
+            "branch_push",
+            "branch_delete",
+            "check_run_update",
+            "release_publish",
+            "release_asset_upload"
+          ]
+        },
+        "repository_key": {
+          "$ref": "#/$defs/ContentDigest"
+        },
+        "target": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "pr_number",
+            "branch",
+            "sha"
+          ],
+          "properties": {
+            "pr_number": {
+              "oneOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "branch": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/BranchName"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "sha": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/GitSha"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          }
+        },
+        "requested_by_attempt_id": {
+          "$ref": "#/$defs/Id",
+          "description": "Issued by the trusted workflow only; candidate-controlled (tag-triggered) code never holds this authority (forecloses R-17)."
+        },
+        "payload_digest": {
+          "$ref": "#/$defs/ContentDigest"
+        }
+      },
+      "description": "FIELD GROUP 13a. Written to the durable outbox BEFORE the mutating provider call is attempted (coding rule 11)."
+    },
+    "ProviderEffectResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "record_id",
+        "record_type",
+        "issued_by",
+        "issued_at",
+        "idempotency_key",
+        "observed_state",
+        "external_ref",
+        "result_digest",
+        "observed_at"
+      ],
+      "properties": {
+        "protocol_version": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "record_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "record_type": {
+          "const": "provider_effect_result"
+        },
+        "issued_by": {
+          "const": "gitmoot-core"
+        },
+        "issued_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "idempotency_key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "description": "Must equal the idempotency_key of exactly one ProviderEffectIntent."
+        },
+        "observed_state": {
+          "type": "string",
+          "enum": [
+            "pending",
+            "applied",
+            "failed",
+            "unknown"
+          ],
+          "description": "'unknown' is the fail-closed outcome after an interruption where the provider's own state could not be re-confirmed (e.g. crash mid-merge). Reconciliation MUST resolve 'unknown' by re-querying the provider keyed on idempotency_key, never by re-attempting the mutation blind."
+        },
+        "external_ref": {
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Provider-native id of the effect (merge commit SHA, comment id, release asset id), or null if not applied."
+        },
+        "result_digest": {
+          "$ref": "#/$defs/ContentDigest"
+        },
+        "observed_at": {
+          "$ref": "#/$defs/Timestamp"
+        }
+      },
+      "description": "FIELD GROUP 13b."
+    },
+    "MigrationRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "record_id",
+        "record_type",
+        "issued_by",
+        "issued_at",
+        "migration_id",
+        "sequence",
+        "content_digest",
+        "predecessor_digest",
+        "applied_at"
+      ],
+      "properties": {
+        "protocol_version": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "record_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "record_type": {
+          "const": "migration_record"
+        },
+        "issued_by": {
+          "const": "gitmoot-core"
+        },
+        "issued_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "migration_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Stable id, not merely the ordinal integer gitmoot's current schema_migrations(version, applied_at) table uses (forecloses R-05: an ordinal-only ledger cannot detect content drift on an already-applied migration)."
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "content_digest": {
+          "$ref": "#/$defs/ContentDigest",
+          "description": "digest of this migration's exact SQL/DDL content."
+        },
+        "predecessor_digest": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/ContentDigest"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Chains to the prior migration's content_digest; a mismatch against a real predecessor fixture is refused (R-05, R-06)."
+        },
+        "applied_at": {
+          "$ref": "#/$defs/Timestamp"
+        }
+      }
+    },
+    "ArtifactRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "record_id",
+        "record_type",
+        "issued_by",
+        "issued_at",
+        "artifact_id",
+        "kind",
+        "content_digest",
+        "storage_uri",
+        "size_bytes",
+        "producer_attempt_id"
+      ],
+      "properties": {
+        "protocol_version": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "record_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "record_type": {
+          "const": "artifact_ref"
+        },
+        "issued_by": {
+          "const": "gitmoot-core"
+        },
+        "issued_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "artifact_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "diff",
+            "patch",
+            "log",
+            "stdout",
+            "stderr",
+            "sbom",
+            "review_note",
+            "plan",
+            "other"
+          ]
+        },
+        "content_digest": {
+          "$ref": "#/$defs/ContentDigest"
+        },
+        "storage_uri": {
+          "type": "string",
+          "pattern": "^cas://[A-Za-z0-9._/-]+/sha256/[0-9a-f]{64}$",
+          "description": "Content-addressed store locator; the digest embedded in the URI MUST equal content_digest.hex (engine-enforced). Never a filesystem pathname -- an artifact can never be silently replaced at a stable path (coding rule 5)."
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "producer_attempt_id": {
+          "$ref": "#/$defs/Id"
+        }
+      },
+      "description": "FIELD GROUP 10. Every reference from CouncilResult/Finding/TypedCommand resolves to bytes through this record -- fixes a completeness gap where one of the three source drafts had no storage locator at all."
+    }
+  }
+}
