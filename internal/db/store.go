@@ -700,6 +700,9 @@ func (s *Store) Migrate(ctx context.Context) error {
 	if err := s.backfillJobRootID(ctx); err != nil {
 		return err
 	}
+	if err := s.reconcileMigrationIdentity(ctx); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -9134,5 +9137,31 @@ CREATE INDEX idx_pipeline_trigger_states_upstream ON pipeline_trigger_states(ups
 DELETE FROM job_events
 WHERE kind = 'advance_retry'
   AND id NOT IN (SELECT MAX(id) FROM job_events WHERE kind = 'advance_retry' GROUP BY job_id);
+	`,
+	// Council correction packet W1-01 (R-05): migration ledger content-drift
+	// detection. schema_migrations previously stored only an integer version and
+	// an applied_at timestamp, so if a historical migration's SQL body were ever
+	// edited after it had already been applied to a live database, the ordinal
+	// guard (the `exists > 0` short-circuit in applyMigration) would silently
+	// skip re-running it -- an already-applied database has no way to notice its
+	// recorded schema no longer matches the source that produced it. These three
+	// columns give every migration row a stable identity: migration_id (a TEXT
+	// id independent of both the version INTEGER and the migration's own
+	// content, so drift can be told apart from a rename), content_digest (the
+	// sha256 of the exact SQL this row was applied with), and predecessor_digest
+	// (the content_digest of the migration immediately before it, chaining the
+	// ledger so a migration spliced into the middle of history is also
+	// detectable even if its own digest happens to collide). This migration is
+	// itself applied through the plain ordinal path above -- it cannot depend on
+	// the very columns it creates. reconcileMigrationIdentity
+	// (migration_identity.go) backfills these columns for every pre-existing
+	// historical row the first time Migrate runs after upgrade, exactly like
+	// backfillJobRootID's one-time historical heal, and thereafter re-validates
+	// every already-stamped row on every subsequent boot, refusing to proceed on
+	// a mismatch instead of silently skipping the drifted content.
+	`
+ALTER TABLE schema_migrations ADD COLUMN migration_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE schema_migrations ADD COLUMN content_digest TEXT NOT NULL DEFAULT '';
+ALTER TABLE schema_migrations ADD COLUMN predecessor_digest TEXT NOT NULL DEFAULT '';
 	`,
 }
